@@ -96,8 +96,15 @@ class SearchRunnerService:
                     search_input = self._get_search_input(page)
                     page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
                     self._type_query_and_submit(page, search_input, query)
-                    self._handle_captcha_if_present(page, context=f"после отправки запроса '{query}'")
+                    resolution = self._handle_captcha_if_present(page, context=f"после отправки запроса '{query}'")
                     page.wait_for_timeout(random.randint(2500, 4200))
+                    
+                    if not resolution.detected or resolution.solved:
+                        self._log("run_yandex_searches: нажимаю Esc 3 раза с интервалом 0.5с")
+                        for _ in range(3):
+                            page.keyboard.press("Escape")
+                            page.wait_for_timeout(500)
+                            
                     executed_count += 1
                     self._log(f"Запрос обработан успешно. Выполнено: {executed_count}/{len(queries)}")
             except PlaywrightTimeoutError:
@@ -303,8 +310,14 @@ class SearchRunnerService:
                     search_input = self._get_search_input(page)
                     page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
                     self._type_query_and_submit(page, search_input, query)
-                    self._handle_captcha_if_present(page, context=f"после отправки запроса '{query}'")
+                    resolution = self._handle_captcha_if_present(page, context=f"после отправки запроса '{query}'")
                     page.wait_for_timeout(random.randint(2500, 4200))
+                    
+                    if not resolution.detected or resolution.solved:
+                        self._log("simulate_search_action: нажимаю Esc 3 раза с интервалом 0.5с")
+                        for _ in range(3):
+                            page.keyboard.press("Escape")
+                            page.wait_for_timeout(500)
                     
                     self._open_large_map(page)
                     if self._find_and_open_organization(
@@ -687,11 +700,9 @@ class SearchRunnerService:
         key_payload: dict[str, object],
         card_payload: dict[str, object],
     ) -> bool:
-        """Открывает Яндекс.Карты и выполняет там тот же запрос, что и в режиме поиска."""
+        """Открывает Яндекс.Карты и выполняет там запрос (только по фразе/ключу)."""
         phrase = str(key_payload.get("phrase", ""))
-        city = str(card_payload.get("city", ""))
-        street = str(card_payload.get("street", ""))
-        query = self._build_query(phrase, city, street)
+        query = phrase.strip()
         if not query:
             self._log("simulate_maps_action: пустой запрос, пропуск.")
             return False
@@ -1178,7 +1189,7 @@ class SearchRunnerService:
         page,
         wait_ms: int = 10000,
         context: str = "browser-step",
-    ) -> None:
+    ):
         """Ждет возможную капчу, нажимает чекбокс и дает время решить ее вручную."""
         resolution = self._captcha_service.check_and_resolve(page, context=context, wait_ms=wait_ms)
         if resolution.detected and not resolution.solved:
@@ -1186,6 +1197,7 @@ class SearchRunnerService:
                 "Капча не решена, дальнейший шаг может завершиться таймаутом. "
                 f"Детали: {resolution.message}"
             )
+        return resolution
 
     @staticmethod
     def _log(message: str) -> None:
