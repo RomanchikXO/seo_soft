@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ShagTeamPro</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div id="initScreen" class="init-screen">
+    <div class="init-card">
+      <h1>ShagTeamPro</h1>
+      <p id="initMessage">Запуск и проверка зависимостей...</p>
+      <div class="progress">
+        <div id="initProgress" class="progress-bar"></div>
+      </div>
+    </div>
+  </div>
+
+  <header class="topbar">
+    <div class="title">ShagTeamPro</div>
+    <div class="topbar-actions">
+      <button id="openGlobalSettingsBtn" class="icon-btn" title="Глобальные настройки">🤖</button>
+      <button id="openSettingsBtn" class="icon-btn" title="Настройки">⚙</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="cards-panel">
+      <div class="panel-title">Карточки</div>
+      <button id="optimizationSelectAllBtn" class="btn hidden">Выбрать все</button>
+      <div id="cardsList" class="cards-list"></div>
+      <button id="addCardBtn" class="btn primary">+ Добавить карточку</button>
+    </aside>
+
+    <section class="workspace">
+      <div id="workspaceEmpty" class="empty-state">Выберите карточку</div>
+      <div id="workspaceContent" class="hidden">
+        <div class="workspace-header">
+          <h2 id="selectedCardTitle">Карточка</h2>
+          <div class="tabs">
+            <button id="tabKeysBtn" class="tab active">Ключи</button>
+            <button id="tabOptimizationBtn" class="tab">Оптимизация</button>
+          </div>
+        </div>
+
+        <section id="keysSection" class="section">
+          <div class="section-actions">
+            <button id="addKeyBtn" class="btn primary">Добавить</button>
+            <button id="deleteKeyBtn" class="btn">Удалить</button>
+            <button id="runSearchBtn" class="btn play hidden">▶ Запуск</button>
+            <span id="runStatus" class="run-status"></span>
+            <label class="btn file">
+              Импорт Excel
+              <input id="importFileInput" type="file" accept=".xlsx,.xls" />
+            </label>
+          </div>
+          <div class="table-wrap">
+            <table id="keysTable">
+              <thead id="keysHead"></thead>
+              <tbody id="keysBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="optimizationSection" class="section hidden">
+          <div class="optimization-controls">
+            <label class="threads-label" for="optimizationThreadsRange">
+              Потоки: <span id="optimizationThreadsValue">1</span>
+            </label>
+            <input
+              id="optimizationThreadsRange"
+              class="threads-range"
+              type="range"
+              min="1"
+              max="50"
+              step="1"
+              value="1"
+            />
+            <button id="optimizationPlayBtn" class="btn play optimization-play-btn">▶ Play</button>
+          </div>
+          <div id="optimizationStatus" class="run-status"></div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <div id="settingsModal" class="modal hidden">
+    <div class="modal-content">
+      <h3 id="settingsModalTitle">Настройки карточки</h3>
+      <div class="settings-columns">
+        <div class="settings-column">
+          <label>Название<input id="cardNameInput" type="text" /></label>
+          <label>Город<input id="cityInput" type="text" /></label>
+          <label>Улица<input id="streetInput" type="text" /></label>
+          <label>Дом<input id="houseInput" type="text" /></label>
+          <label>Организация (как на картах)<input id="organizationInput" type="text" /></label>
+          <label>Координаты (через запятую)<input id="coordinatesInput" type="text" /></label>
+        </div>
+
+        <div class="settings-column with-divider">
+          <label>Переходы в поиске<input id="searchTransitionsInput" type="number" min="0" step="0.01" /></label>
+          <label>Переходы в карты<input id="mapsTransitionsInput" type="number" min="0" step="0.01" /></label>
+          <label>Шанс открытия карточки конкурента (%)<input id="competitorOpenChancePercentInput" type="number" min="0" step="0.01" /></label>
+          <label>MAX открытых карточек конкурентов (шт.)<input id="maxOpenCompetitorCardsInput" type="number" min="0" step="0.01" /></label>
+          <label>MIN сон на карточке конкурента (сек.)<input id="minSleepCompetitorCardSecInput" type="number" min="0" step="0.01" /></label>
+          <label>MAX сон на карточке конкурента (сек.)<input id="maxSleepCompetitorCardSecInput" type="number" min="0" step="0.01" /></label>
+          <label>MIN сон на обзоре целевой карточки (сек.)<input id="minSleepTargetOverviewSecInput" type="number" min="0" step="0.01" /></label>
+          <label>MAX сон на обзоре целевой карточки (сек.)<input id="maxSleepTargetOverviewSecInput" type="number" min="0" step="0.01" /></label>
+          <label>MIN сон на целевом действии (сек.)<input id="minSleepTargetTabSecInput" type="number" min="0" step="0.01" /></label>
+          <label>MAX сон на целевом действии (сек.)<input id="maxSleepTargetTabSecInput" type="number" min="0" step="0.01" /></label>
+        </div>
+
+        <div class="settings-column with-divider">
+          <label class="inline-checkbox">
+            <input id="allowTargetEventsInput" type="checkbox" />
+            Возможность накрутки целевых событий
+          </label>
+          <label>Клики "Показать номер"<input id="clickShowPhoneInput" type="number" min="0" step="0.01" /></label>
+          <label>Клики "Сайт"<input id="clickWebsiteInput" type="number" min="0" step="0.01" /></label>
+          <label>Клики "Маршрут"<input id="clickRouteInput" type="number" min="0" step="0.01" /></label>
+          <label>Клики в мессенджеры<input id="clickMessengersInput" type="number" min="0" step="0.01" /></label>
+          <label>Клики "Записаться" (сторис)<input id="clickBookStoryInput" type="number" min="0" step="0.01" /></label>
+          <label>Кликов на изменение масштаба карты<input id="mapZoomClicksInput" type="number" min="0" step="0.01" /></label>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="deleteCardBtn" class="btn danger modal-delete-btn hidden">Удалить карточку</button>
+        <button id="closeSettingsBtn" class="btn">Закрыть</button>
+        <button id="saveSettingsBtn" class="btn primary">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="globalSettingsModal" class="modal hidden">
+    <div class="modal-content" style="max-width: 500px;">
+      <h3>Глобальные настройки</h3>
+      <div class="settings-columns">
+        <div class="settings-column">
+          <h4>Сервис обхода капчи</h4>
+          <label class="inline-checkbox">
+            <input type="radio" name="captchaService" value="manual" id="captchaServiceManual" checked>
+            Ручное решение (ожидание в браузере)
+          </label>
+          <label class="inline-checkbox" style="margin-top: 8px;">
+            <input type="radio" name="captchaService" value="capsola" id="captchaServiceCapsola">
+            Capsola
+          </label>
+          
+          <div id="capsolaSettingsArea" class="hidden" style="margin-top: 16px; padding-left: 24px;">
+            <label>API-токен Capsola<input id="capsolaTokenInput" type="text" placeholder="Введите ключ" /></label>
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="closeGlobalSettingsBtn" class="btn">Закрыть</button>
+        <button id="saveGlobalSettingsBtn" class="btn primary">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
