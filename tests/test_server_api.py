@@ -32,15 +32,36 @@ class StubSearchRunner:
         }
 
 
+class StubYandexOrganizationService:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def autofill_from_url(self, url: str) -> dict[str, str]:
+        self.calls.append(url)
+        if "bad" in url:
+            raise ValueError("Некорректная ссылка.")
+        return {
+            "organization": "Тестовая организация",
+            "address": "Москва, Тверская улица, 1",
+            "city": "Москва",
+            "street": "Тверская улица",
+            "house": "1",
+            "coordinates": "37.6176, 55.7558",
+            "yandex_org_url": url,
+        }
+
+
 def test_api_health_and_cards_flow(tmp_path: Path) -> None:
     services = build_services(database_path=tmp_path / "api.db")
     stub_runner = StubSearchRunner()
+    stub_yandex_org = StubYandexOrganizationService()
     services = AppServices(
         card_service=services.card_service,
         key_service=services.key_service,
         import_service=services.import_service,
         settings_service=services.settings_service,
         search_runner_service=stub_runner,
+        yandex_organization_service=stub_yandex_org,
     )
     base_dir = Path(__file__).resolve().parents[1] / "webapp"
     app = create_app(base_dir=base_dir, services=services)
@@ -102,12 +123,14 @@ def test_api_health_and_cards_flow(tmp_path: Path) -> None:
 def test_api_import_and_delete_key(tmp_path: Path, monkeypatch) -> None:
     services = build_services(database_path=tmp_path / "api.db")
     stub_runner = StubSearchRunner()
+    stub_yandex_org = StubYandexOrganizationService()
     services = AppServices(
         card_service=services.card_service,
         key_service=services.key_service,
         import_service=services.import_service,
         settings_service=services.settings_service,
         search_runner_service=stub_runner,
+        yandex_organization_service=stub_yandex_org,
     )
     base_dir = Path(__file__).resolve().parents[1] / "webapp"
     app = create_app(base_dir=base_dir, services=services)
@@ -134,12 +157,14 @@ def test_api_import_and_delete_key(tmp_path: Path, monkeypatch) -> None:
 def test_api_optimization_run_uses_selected_cards_and_flags(tmp_path: Path) -> None:
     services = build_services(database_path=tmp_path / "api.db")
     stub_runner = StubSearchRunner()
+    stub_yandex_org = StubYandexOrganizationService()
     services = AppServices(
         card_service=services.card_service,
         key_service=services.key_service,
         import_service=services.import_service,
         settings_service=services.settings_service,
         search_runner_service=stub_runner,
+        yandex_organization_service=stub_yandex_org,
     )
     base_dir = Path(__file__).resolve().parents[1] / "webapp"
     app = create_app(base_dir=base_dir, services=services)
@@ -188,3 +213,35 @@ def test_api_optimization_run_uses_selected_cards_and_flags(tmp_path: Path) -> N
 
         bad_response = client.post("/api/optimization/run", json={"card_ids": [card_a_id], "threads": 0})
         assert bad_response.status_code in (400, 422)
+
+
+def test_api_yandex_org_autofill(tmp_path: Path) -> None:
+    services = build_services(database_path=tmp_path / "api.db")
+    stub_runner = StubSearchRunner()
+    stub_yandex_org = StubYandexOrganizationService()
+    services = AppServices(
+        card_service=services.card_service,
+        key_service=services.key_service,
+        import_service=services.import_service,
+        settings_service=services.settings_service,
+        search_runner_service=stub_runner,
+        yandex_organization_service=stub_yandex_org,
+    )
+    base_dir = Path(__file__).resolve().parents[1] / "webapp"
+    app = create_app(base_dir=base_dir, services=services)
+
+    with TestClient(app) as client:
+        ok_response = client.post(
+            "/api/yandex-org/autofill",
+            json={"url": "https://yandex.ru/maps/org/test/123"},
+        )
+        assert ok_response.status_code == 200
+        assert ok_response.json()["organization"] == "Тестовая организация"
+        assert ok_response.json()["city"] == "Москва"
+        assert stub_yandex_org.calls == ["https://yandex.ru/maps/org/test/123"]
+
+        bad_response = client.post(
+            "/api/yandex-org/autofill",
+            json={"url": "https://yandex.ru/maps/org/bad/123"},
+        )
+        assert bad_response.status_code == 400

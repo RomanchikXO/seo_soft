@@ -9,6 +9,8 @@ from shagteampro.application.services.key_service import KeyService
 from shagteampro.application.services.notification_service import NotificationService
 from shagteampro.application.services.search_runner_service import SearchRunnerService
 from shagteampro.application.services.settings_service import SettingsService
+from shagteampro.application.services.yandex_organization_service import YandexOrganizationService
+from shagteampro.infrastructure.parsers.yandex_organization_parser import YandexOrganizationParser
 from shagteampro.infrastructure.storage.sqlite_repo import SqliteRepository
 
 
@@ -225,6 +227,40 @@ def test_search_runner_retries_after_missing_browser(monkeypatch: pytest.MonkeyP
     browser = service._launch_chromium_with_recovery(object(), tmp_path / "pw")
     assert browser == "browser-object"
     assert install_calls == [tmp_path / "pw"]
+
+
+def test_yandex_org_service_requires_non_empty_url() -> None:
+    class _StubParser:
+        def parse(self, _url: str) -> dict[str, str]:
+            return {}
+
+    service = YandexOrganizationService(parser=_StubParser())  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        service.autofill_from_url("   ")
+
+
+def test_yandex_org_parser_extracts_coordinates_and_address_parts() -> None:
+    parser = YandexOrganizationParser()
+
+    assert (
+        parser._coordinates_from_url("https://yandex.ru/maps/?ll=37.6176%2C55.7558&z=17")
+        == "37.6176, 55.7558"
+    )
+    assert (
+        parser._coordinates_from_url("https://yandex.ru/maps/#ll=37.6176%2C55.7558&z=17")
+        == "37.6176, 55.7558"
+    )
+    assert parser._coordinates_from_url("https://yandex.ru/maps/") == ""
+
+    city, street, house = parser._split_address("Россия, Москва, Тверская улица, дом 1")
+    assert city == "Москва"
+    assert street == "Тверская улица"
+    assert house == "дом 1"
+
+    city2, street2, house2 = parser._split_address("Московская область, Химки, Ленинский проспект, 7")
+    assert city2 == "Химки"
+    assert street2 == "Ленинский проспект"
+    assert house2 == "7"
 
 
 def test_search_runner_ensure_chromium_installed_skips_if_exists(

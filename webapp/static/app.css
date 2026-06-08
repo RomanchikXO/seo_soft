@@ -287,6 +287,28 @@ tr.selected { background: #1b1b1b; }
   gap: 8px;
 }
 .modal-content label { display: flex; flex-direction: column; gap: 4px; color: #c6c6c6; }
+.input-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.input-inline input {
+  flex: 1;
+}
+.field-status {
+  min-height: 18px;
+  color: #9aa0a6;
+  font-size: 12px;
+  line-height: 1.4;
+  display: block;
+  margin-top: -2px;
+}
+.field-status.error {
+  color: #ff8b8b;
+}
+.field-status.success {
+  color: #86e4ac;
+}
 .settings-columns {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

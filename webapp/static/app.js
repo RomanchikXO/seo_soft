@@ -154,6 +154,9 @@ const ui = {
   settingsModal: document.getElementById("settingsModal"),
   settingsModalTitle: document.getElementById("settingsModalTitle"),
   cardNameInput: document.getElementById("cardNameInput"),
+  yandexOrgUrlInput: document.getElementById("yandexOrgUrlInput"),
+  autofillYandexOrgBtn: document.getElementById("autofillYandexOrgBtn"),
+  autofillYandexOrgStatus: document.getElementById("autofillYandexOrgStatus"),
   cityInput: document.getElementById("cityInput"),
   streetInput: document.getElementById("streetInput"),
   houseInput: document.getElementById("houseInput"),
@@ -398,6 +401,8 @@ function parseNonNegativeNumber(rawValue, fieldName) {
 function fillSettingsForm(cardName, settings) {
   const merged = { ...CARD_SETTINGS_DEFAULTS, ...(settings || {}) };
   ui.cardNameInput.value = cardName || "";
+  ui.yandexOrgUrlInput.value = "";
+  setAutofillStatus("");
   ui.cityInput.value = merged.city || "";
   ui.streetInput.value = merged.street || "";
   ui.houseInput.value = merged.house || "";
@@ -422,6 +427,58 @@ function collectSettingsPayload() {
     payload[field.key] = parseNonNegativeNumber(ui[field.inputKey].value, field.label);
   }
   return payload;
+}
+
+function setAutofillStatus(message, type = "") {
+  if (!ui.autofillYandexOrgStatus) return;
+  ui.autofillYandexOrgStatus.textContent = message || "";
+  ui.autofillYandexOrgStatus.classList.remove("error", "success");
+  if (type) {
+    ui.autofillYandexOrgStatus.classList.add(type);
+  }
+}
+
+async function autofillByYandexOrgUrl() {
+  const url = (ui.yandexOrgUrlInput.value || "").trim();
+  if (!url) {
+    setAutofillStatus("Введите ссылку на организацию.", "error");
+    return;
+  }
+
+  ui.autofillYandexOrgBtn.disabled = true;
+  const initialText = ui.autofillYandexOrgBtn.textContent;
+  ui.autofillYandexOrgBtn.textContent = "Заполняю...";
+  setAutofillStatus("Получаю данные из Яндекс.Карт...");
+
+  try {
+    const data = await api("/api/yandex-org/autofill", {
+      method: "POST",
+      body: JSON.stringify({ url }),
+    });
+
+    if (data.organization) {
+      ui.organizationInput.value = data.organization;
+    }
+    if (data.city) {
+      ui.cityInput.value = data.city;
+    }
+    if (data.street) {
+      ui.streetInput.value = data.street;
+    }
+    if (data.house) {
+      ui.houseInput.value = data.house;
+    }
+    if (data.coordinates) {
+      ui.coordinatesInput.value = data.coordinates;
+    }
+
+    setAutofillStatus("Данные организации заполнены.", "success");
+  } catch (error) {
+    setAutofillStatus(`Не удалось заполнить: ${error.message}`, "error");
+  } finally {
+    ui.autofillYandexOrgBtn.disabled = false;
+    ui.autofillYandexOrgBtn.textContent = initialText;
+  }
 }
 
 function switchTab(tab) {
@@ -981,6 +1038,7 @@ ui.settingsModal.onclick = (event) => {
   }
 };
 ui.saveSettingsBtn.onclick = saveSettings;
+ui.autofillYandexOrgBtn.onclick = autofillByYandexOrgUrl;
 window.addEventListener("pagehide", requestShutdownOnClose);
 
 syncOptimizationThreadsUi();

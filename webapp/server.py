@@ -16,7 +16,9 @@ from shagteampro.application.services.key_service import KeyService
 from shagteampro.application.services.notification_service import NotificationService
 from shagteampro.application.services.search_runner_service import SearchRunnerService
 from shagteampro.application.services.settings_service import SettingsService
+from shagteampro.application.services.yandex_organization_service import YandexOrganizationService
 from shagteampro.infrastructure.importers.excel_importer import ExcelImporter
+from shagteampro.infrastructure.parsers.yandex_organization_parser import YandexOrganizationParser
 from shagteampro.infrastructure.storage.sqlite_repo import SqliteRepository
 
 
@@ -27,6 +29,7 @@ class AppServices:
     import_service: ImportService
     settings_service: SettingsService
     search_runner_service: SearchRunnerService
+    yandex_organization_service: YandexOrganizationService
     notification_service: NotificationService | None = None
 
 
@@ -95,6 +98,10 @@ class OptimizationRunRequest(BaseModel):
     threads: int = Field(default=1, ge=1, le=50)
 
 
+class YandexOrgAutofillRequest(BaseModel):
+    url: str
+
+
 def _coerce_card_settings(settings: dict[str, str]) -> dict[str, object]:
     defaults = CardSettingsRequest().model_dump()
     result: dict[str, object] = dict(defaults)
@@ -129,6 +136,7 @@ def build_services(database_path: Path | None = None) -> AppServices:
         import_service=ImportService(excel_importer=ExcelImporter()),
         settings_service=settings_service,
         search_runner_service=SearchRunnerService(settings_service=settings_service),
+        yandex_organization_service=YandexOrganizationService(parser=YandexOrganizationParser()),
         notification_service=NotificationService(settings_service=settings_service),
     )
 
@@ -344,6 +352,18 @@ def create_app(base_dir: Path | None = None, services: AppServices | None = None
                 pass
 
         return summary
+
+    @app.post("/api/yandex-org/autofill")
+    def yandex_org_autofill(payload: YandexOrgAutofillRequest) -> dict[str, str]:
+        try:
+            return resolved_services.yandex_organization_service.autofill_from_url(payload.url)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(
+                status_code=502,
+                detail="Не удалось получить данные организации из Яндекс.Карт.",
+            ) from error
 
     @app.post("/api/shutdown")
     def shutdown(request: Request) -> dict[str, bool]:
