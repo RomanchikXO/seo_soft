@@ -136,14 +136,19 @@ def test_search_runner_optimization_runs_search_and_maps_for_same_card(
 ) -> None:
     service = SearchRunnerService()
     monkeypatch.setattr(service, "ensure_chromium_installed", lambda: False)
-    calls: list[tuple[tuple[int, ...], int]] = []
+    search_calls: list[int] = []
+    maps_calls: list[int] = []
 
-    def fake_run_target_loop(keys: list[dict[str, object]], target: int, card_payload: dict[str, object], mode: str) -> dict[str, object]:
-        key_ids = tuple(sorted(int(item["id"]) for item in keys))
-        calls.append((key_ids, target))
-        return {"performed": target, "effect_keys": list(key_ids)}
+    def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]) -> bool:
+        search_calls.append(int(key_payload["id"]))
+        return True
 
-    monkeypatch.setattr(service, "_run_target_loop", fake_run_target_loop)
+    def fake_maps(key_payload: dict[str, object], card_payload: dict[str, object]) -> bool:
+        maps_calls.append(int(key_payload["id"]))
+        return True
+
+    monkeypatch.setattr(service, "_simulate_search_action", fake_search)
+    monkeypatch.setattr(service, "_simulate_browser_action_one_second", fake_maps)
 
     result = service.run_cards_optimization(
         cards=[
@@ -160,7 +165,12 @@ def test_search_runner_optimization_runs_search_and_maps_for_same_card(
         threads=4,
     )
 
-    assert sorted(calls) == [((10,), 2), ((10,), 3)]
+    assert len(search_calls) == 2
+    assert len(maps_calls) == 3
+    assert set(search_calls) == {10}
+    assert set(maps_calls) == {10}
     assert result["processed_cards"] == 1
     assert result["total_search_performed"] == 2
     assert result["total_maps_performed"] == 3
+    assert result["cards"][0]["search_effect_keys"] == [10]
+    assert result["cards"][0]["maps_effect_keys"] == [10]

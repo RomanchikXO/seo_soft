@@ -139,15 +139,10 @@ class SearchRunnerService:
             int(card_payload.get("card_id", 0)): self._empty_card_result(card_payload)
             for card_payload in prepared_cards
         }
-        future_to_meta: dict[concurrent.futures.Future, tuple[int, str]] = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for card_payload in prepared_cards:
-                card_id = int(card_payload.get("card_id", 0))
-                future_to_meta.update(self._submit_card_targets(executor, card_payload, card_id))
-
-            for future in concurrent.futures.as_completed(future_to_meta):
-                card_id, mode = future_to_meta[future]
-                self._apply_target_result(card_results[card_id], mode, future.result())
+        targets = self._build_target_states(prepared_cards)
+        self._run_targets_in_pool(targets, max_workers)
+        for state in targets:
+            self._apply_target_state(card_results[state["card_id"]], state)
 
         return self._build_optimization_summary(card_results)
 
@@ -164,34 +159,132 @@ class SearchRunnerService:
             "maps_effect_keys": [],
         }
 
-    def _submit_card_targets(
-        self,
-        executor: concurrent.futures.Executor,
-        card_payload: dict[str, object],
-        card_id: int,
-    ) -> dict[concurrent.futures.Future, tuple[int, str]]:
-        """Создает фоновые задачи для search/maps целей одной карточки."""
-        key_payloads = self._card_key_payloads(card_payload)
-        target_specs = [
-            (
-                "search",
-                self._to_non_negative_int(card_payload.get("search_target", 0)),
-                [key for key in key_payloads if bool(key.get("search_enabled"))],
-            ),
-            (
-                "maps",
-                self._to_non_negative_int(card_payload.get("maps_target", 0)),
-                [key for key in key_payloads if bool(key.get("maps_enabled"))],
-            ),
-        ]
-        submitted: dict[concurrent.futures.Future, tuple[int, str]] = {}
-        for mode, target, keys in target_specs:
-            if target <= 0 or not keys:
+    def _build_target_states(self, prepared_cards: list[dict[str, object]]) -> list[dict[str, object]]:
+        """Создает плоский список целей (карточка × режим), которые нужно набрать."""
+        targets: list[dict[str, object]] = []
+        for card_payload in prepared_cards:
+            card_id = int(card_payload.get("card_id", 0))
+            key_payloads = self._card_key_payloads(card_payload)
+            target_specs = [
+                (
+                    "search",
+                    self._to_non_negative_int(card_payload.get("search_target", 0)),
+                    [key for key in key_payloads if bool(key.get("search_enabled"))],
+                ),
+                (
+                    "maps",
+                    self._to_non_negative_int(card_payload.get("maps_target", 0)),
+                    [key for key in key_payloads if bool(key.get("maps_enabled"))],
+                ),
+            ]
+            for mode, target, keys in target_specs:
+                if target <= 0 or not keys:
+                    continue
+                self._log(f"Карточка #{card_id}: цель {mode}, target={target}, ключей={len(keys)}")
+                targets.append(
+                    {
+                        "card_id": card_id,
+                        "card_payload": card_payload,
+                        "mode": mode,
+                        "target": target,
+                        "active_keys": list(keys),
+                        "performed": 0,
+                        "in_flight": 0,
+                        "effect_key_ids": set(),
+                    }
+                )
+        return targets
+
+    def _run_targets_in_pool(self, targets: list[dict[str, object]], max_workers: int) -> None:
+        """Выполняет все цели в одном общем пуле, держа до max_workers действий одновременно.
+
+        Единица параллелизма — это одно действие по одному ключу. Планировщик в главном
+        потоке наполняет пул, поэтому при N потоках одновременно открывается до N браузеров,
+        даже если все действия идут по одной фразе/ключу.
+        """
+        if not targets:
+            return
+
+        future_meta: dict[concurrent.futures.Future, tuple[dict[str, object], dict[str, object]]] = {}
+
+        def fill(executor: concurrent.futures.Executor) -> None:
+            while len(future_meta) < max_workers:
+                state = self._pick_dispatchable_target(targets)
+                if state is None:
+                    break
+                key_payload = random.choice(state["active_keys"])
+                state["in_flight"] += 1
+                future = executor.submit(self._execute_single_action, state, key_payload)
+                future_meta[future] = (state, key_payload)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            fill(executor)
+            while future_meta:
+                done, _ = concurrent.futures.wait(
+                    future_meta.keys(), return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for future in done:
+                    state, key_payload = future_meta.pop(future)
+                    self._consume_action_result(state, key_payload, future)
+                fill(executor)
+
+        for state in targets:
+            mode = state["mode"]
+            self._log(
+                f"Карточка #{state['card_id']}: {mode} завершен, выполнено="
+                f"{state['performed']}/{state['target']}."
+            )
+
+    @staticmethod
+    def _pick_dispatchable_target(targets: list[dict[str, object]]) -> dict[str, object] | None:
+        """Выбирает цель, которой еще нужны действия и есть свободный «бюджет» на отправку."""
+        for state in targets:
+            if not state["active_keys"]:
                 continue
-            self._log(f"Карточка #{card_id}: запускаю {mode}-задачу, target={target}, ключей={len(keys)}")
-            future = executor.submit(self._run_target_loop, keys, target, card_payload, mode)
-            submitted[future] = (card_id, mode)
-        return submitted
+            if state["performed"] + state["in_flight"] >= state["target"]:
+                continue
+            return state
+        return None
+
+    def _consume_action_result(
+        self,
+        state: dict[str, object],
+        key_payload: dict[str, object],
+        future: concurrent.futures.Future,
+    ) -> None:
+        """Учитывает результат одного завершенного действия (в главном потоке планировщика)."""
+        state["in_flight"] -= 1
+        try:
+            effect = bool(future.result())
+        except Exception as error:
+            effect = False
+            self._log(f"Карточка #{state['card_id']}: действие {state['mode']} упало с ошибкой {error}.")
+
+        if effect:
+            if state["performed"] < state["target"]:
+                state["performed"] += 1
+                key_id = int(key_payload.get("id", 0))
+                if key_id:
+                    state["effect_key_ids"].add(key_id)
+                self._log(
+                    f"Карточка #{state['card_id']}: {state['mode']} засчитано "
+                    f"{state['performed']}/{state['target']}."
+                )
+        else:
+            try:
+                state["active_keys"].remove(key_payload)
+            except ValueError:
+                pass
+            if not state["active_keys"] and state["performed"] < state["target"]:
+                self._log(
+                    f"Карточка #{state['card_id']}: {state['mode']} — закончились результативные ключи."
+                )
+
+    def _execute_single_action(self, state: dict[str, object], key_payload: dict[str, object]) -> bool:
+        """Выполняет одно действие по ключу в зависимости от режима цели."""
+        if state["mode"] == "search":
+            return self._simulate_search_action(key_payload, state["card_payload"])
+        return self._simulate_browser_action_one_second(key_payload, state["card_payload"])
 
     @staticmethod
     def _card_key_payloads(card_payload: dict[str, object]) -> list[dict[str, object]]:
@@ -199,16 +292,15 @@ class SearchRunnerService:
         key_payloads = card_payload.get("keys", [])
         return key_payloads if isinstance(key_payloads, list) else []
 
-    def _apply_target_result(
+    def _apply_target_state(
         self,
         card_entry: dict[str, object],
-        mode: str,
-        result: dict[str, object],
+        state: dict[str, object],
     ) -> None:
-        """Записывает результат выполненной search/maps задачи в строку карточки."""
-        card_entry[f"{mode}_performed"] = int(result["performed"])
-        card_entry[f"{mode}_effect_keys"] = result["effect_keys"]
-        self._log(f"Карточка #{card_entry['card_id']}: {mode} завершен, выполнено={card_entry[f'{mode}_performed']}")
+        """Записывает итог выполненной search/maps цели в строку карточки."""
+        mode = state["mode"]
+        card_entry[f"{mode}_performed"] = int(state["performed"])
+        card_entry[f"{mode}_effect_keys"] = sorted(state["effect_key_ids"])
 
     def _build_optimization_summary(self, card_results: dict[int, dict[str, object]]) -> dict[str, object]:
         """Собирает итоговый ответ оптимизации по всем карточкам."""
@@ -234,46 +326,6 @@ class SearchRunnerService:
             "total_maps_performed": totals["maps_performed"],
             "cards": results,
         }
-
-    def _run_target_loop(self, keys: list[dict[str, object]], target: int, card_payload: dict[str, object], mode: str) -> dict[str, object]:
-        """Выполняет нужное количество результативных действий по ключам."""
-        if target <= 0 or not keys:
-            self._log(f"Цикл {mode}: пропуск, target={target}, ключей={len(keys)}")
-            return {"performed": 0, "effect_keys": []}
-
-        active_keys = list(keys)
-        performed = 0
-        effect_key_ids: set[int] = set()
-        self._log(f"Цикл {mode}: старт, target={target}, ключей={len(active_keys)}")
-        while performed < target and active_keys:
-            pass_keys = random.sample(active_keys, len(active_keys))
-            effectful_keys_this_pass: list[dict[str, object]] = []
-            for key_payload in pass_keys:
-                if performed >= target:
-                    break
-                if mode == "search":
-                    effect = self._simulate_search_action(key_payload, card_payload)
-                else:
-                    effect = self._simulate_browser_action_one_second(key_payload, card_payload)
-                if not effect:
-                    self._log(f"Цикл {mode}: действие по ключу не дало эффекта.")
-                    continue
-                performed += 1
-                key_id = int(key_payload.get("id", 0))
-                if key_id:
-                    effect_key_ids.add(key_id)
-                effectful_keys_this_pass.append(key_payload)
-                self._log(f"Цикл {mode}: засчитано действие {performed}/{target}.")
-
-            if performed >= target:
-                break
-            if not effectful_keys_this_pass:
-                self._log(f"Цикл {mode}: нет результативных ключей в проходе, завершаю.")
-                break
-            active_keys = effectful_keys_this_pass
-
-        self._log(f"Цикл {mode}: завершен, выполнено={performed}.")
-        return {"performed": performed, "effect_keys": sorted(effect_key_ids)}
 
     def _simulate_search_action(self, key_payload: dict[str, object], card_payload: dict[str, object]) -> bool:
         """Выполняет полный сценарий поиска организации и активности в ее карточке."""
