@@ -20,6 +20,7 @@
   <header class="topbar">
     <div class="title">ShagTeamPro</div>
     <div class="topbar-actions">
+      <button id="openScheduleBtn" class="icon-btn" title="Отложенный запуск">🕓</button>
       <button id="openGlobalSettingsBtn" class="icon-btn" title="Глобальные настройки">🤖</button>
       <button id="openSettingsBtn" class="icon-btn" title="Настройки">⚙</button>
     </div>
@@ -79,6 +80,7 @@
             />
             <button id="optimizationPlayBtn" class="btn play optimization-play-btn">▶ Play</button>
           </div>
+          <div id="optimizationScheduleInfo" class="schedule-info hidden"></div>
           <div id="optimizationStatus" class="run-status"></div>
         </section>
       </div>
@@ -167,6 +169,35 @@
       <div class="modal-actions">
         <button id="closeGlobalSettingsBtn" class="btn">Закрыть</button>
         <button id="saveGlobalSettingsBtn" class="btn primary">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="scheduleModal" class="modal hidden">
+    <div class="modal-content schedule-modal-content">
+      <div class="schedule-head">
+        <span class="schedule-icon">🕓</span>
+        <div>
+          <h3>Отложенный запуск</h3>
+          <p class="schedule-hint">Выберите дату и время — оптимизация выбранных карточек запустится автоматически.</p>
+        </div>
+      </div>
+
+      <label class="schedule-field">
+        Дата и время запуска
+        <div class="schedule-field-row">
+          <input id="scheduleDateTimeInput" type="datetime-local" />
+          <button id="resetScheduleBtn" class="btn" type="button" title="Сбросить дату">Сбросить</button>
+        </div>
+        <small class="schedule-note">Если дата не задана — запуск выполнится моментально.</small>
+      </label>
+
+      <div id="scheduleSummary" class="schedule-summary"></div>
+
+      <div class="modal-actions">
+        <button id="cancelScheduleBtn" class="btn danger schedule-cancel-btn hidden">Отменить запуск</button>
+        <button id="closeScheduleBtn" class="btn">Закрыть</button>
+        <button id="confirmScheduleBtn" class="btn primary">Сохранить</button>
       </div>
     </div>
   </div>

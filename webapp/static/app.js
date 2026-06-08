@@ -92,6 +92,11 @@ const state = {
   activeTab: "keys",
   optimizationThreads: 1,
   optimizationSelectedCardIds: new Set(),
+  savedScheduleAt: null,
+  scheduleAt: null,
+  scheduleSnapshot: null,
+  scheduleTimer: null,
+  scheduleCountdownTimer: null,
 };
 
 const ui = {
@@ -123,6 +128,16 @@ const ui = {
   runSearchBtn: document.getElementById("runSearchBtn"),
   runStatus: document.getElementById("runStatus"),
   importFileInput: document.getElementById("importFileInput"),
+
+  openScheduleBtn: document.getElementById("openScheduleBtn"),
+  scheduleModal: document.getElementById("scheduleModal"),
+  scheduleDateTimeInput: document.getElementById("scheduleDateTimeInput"),
+  resetScheduleBtn: document.getElementById("resetScheduleBtn"),
+  scheduleSummary: document.getElementById("scheduleSummary"),
+  optimizationScheduleInfo: document.getElementById("optimizationScheduleInfo"),
+  cancelScheduleBtn: document.getElementById("cancelScheduleBtn"),
+  closeScheduleBtn: document.getElementById("closeScheduleBtn"),
+  confirmScheduleBtn: document.getElementById("confirmScheduleBtn"),
 
   openSettingsBtn: document.getElementById("openSettingsBtn"),
   openGlobalSettingsBtn: document.getElementById("openGlobalSettingsBtn"),
@@ -669,30 +684,32 @@ ui.optimizationSelectAllBtn.onclick = () => {
   renderCards();
   refreshOptimizationStatus();
 };
-ui.optimizationPlayBtn.onclick = async () => {
-  const selectedCount = state.optimizationSelectedCardIds.size;
-  if (selectedCount === 0) {
+async function runOptimization(cardIds, threads) {
+  const ids = cardIds ?? [...state.optimizationSelectedCardIds];
+  const threadCount = threads ?? state.optimizationThreads;
+  if (ids.length === 0) {
     alert("Выберите хотя бы одну карточку для оптимизации.");
     return;
   }
-  if (state.optimizationThreads <= 0) {
+  if (threadCount <= 0) {
     alert("Укажите количество потоков больше 0.");
     return;
   }
   ui.optimizationPlayBtn.disabled = true;
   const initialText = ui.optimizationPlayBtn.textContent;
   ui.optimizationPlayBtn.textContent = "▶ Запуск...";
-  ui.optimizationStatus.textContent = `Выполняется оптимизация: карточек ${selectedCount}, потоков ${state.optimizationThreads}.`;
+  ui.optimizationStatus.textContent = `Выполняется оптимизация: карточек ${ids.length}, потоков ${threadCount}.`;
   try {
     const result = await api("/api/optimization/run", {
       method: "POST",
       body: JSON.stringify({
-        card_ids: [...state.optimizationSelectedCardIds],
-        threads: state.optimizationThreads,
+        card_ids: ids,
+        threads: threadCount,
       }),
     });
     ui.optimizationStatus.textContent =
       `Готово. Карточек: ${result.processed_cards}, Поиск: ${result.total_search_performed}/${result.total_search_target}, Карты: ${result.total_maps_performed}/${result.total_maps_target}.`;
+    return result;
   } catch (error) {
     ui.optimizationStatus.textContent = "Ошибка оптимизации.";
     alert(`Не удалось выполнить оптимизацию: ${error.message}`);
@@ -700,7 +717,41 @@ ui.optimizationPlayBtn.onclick = async () => {
     ui.optimizationPlayBtn.disabled = false;
     ui.optimizationPlayBtn.textContent = initialText;
   }
-};
+}
+
+function armScheduledRun() {
+  const cardIds = [...state.optimizationSelectedCardIds];
+  if (cardIds.length === 0) {
+    alert("Выберите хотя бы одну карточку для оптимизации.");
+    return;
+  }
+  if (state.optimizationThreads <= 0) {
+    alert("Укажите количество потоков больше 0.");
+    return;
+  }
+  const delay = state.savedScheduleAt - Date.now();
+  clearSchedule();
+  state.scheduleAt = state.savedScheduleAt;
+  state.scheduleSnapshot = { cardIds, threads: state.optimizationThreads };
+  state.scheduleTimer = setTimeout(triggerScheduledRun, delay);
+  state.scheduleCountdownTimer = setInterval(updateScheduleInfo, 1000);
+  updateScheduleView();
+}
+
+function handlePlayClick() {
+  if (state.scheduleAt) {
+    return;
+  }
+  if (state.savedScheduleAt && state.savedScheduleAt > Date.now()) {
+    armScheduledRun();
+    return;
+  }
+  state.savedScheduleAt = null;
+  updateScheduleView();
+  runOptimization();
+}
+
+ui.optimizationPlayBtn.onclick = handlePlayClick;
 async function openGlobalSettingsModal() {
   ui.globalSettingsModal.classList.remove("hidden");
   try {
@@ -765,6 +816,153 @@ ui.saveGlobalSettingsBtn.onclick = saveGlobalSettings;
 ui.globalSettingsModal.onclick = (event) => {
   if (event.target === ui.globalSettingsModal) {
     ui.globalSettingsModal.classList.add("hidden");
+  }
+};
+
+function toLocalInputValue(date) {
+  const pad = (n) => String(n).padStart(2, "0");
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}`
+  );
+}
+
+function formatCountdown(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const pad = (n) => String(n).padStart(2, "0");
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+}
+
+function clearSchedule() {
+  if (state.scheduleTimer) {
+    clearTimeout(state.scheduleTimer);
+    state.scheduleTimer = null;
+  }
+  if (state.scheduleCountdownTimer) {
+    clearInterval(state.scheduleCountdownTimer);
+    state.scheduleCountdownTimer = null;
+  }
+  state.scheduleAt = null;
+  state.scheduleSnapshot = null;
+}
+
+function updateScheduleView() {
+  const count = state.optimizationSelectedCardIds.size;
+  const hasSaved = !!state.savedScheduleAt;
+  const isArmed = !!state.scheduleAt;
+
+  ui.openScheduleBtn.classList.toggle("scheduled", hasSaved || isArmed);
+
+  if (hasSaved) {
+    const when = new Date(state.savedScheduleAt).toLocaleString("ru-RU");
+    ui.scheduleSummary.textContent =
+      `Сохранено время запуска: ${when}. Запуск начнётся после нажатия «Play».`;
+    ui.cancelScheduleBtn.classList.remove("hidden");
+  } else {
+    ui.scheduleSummary.textContent =
+      `Будет запущена оптимизация выбранных карточек. Сейчас выбрано: ${count}, потоки: ${state.optimizationThreads}.`;
+    ui.cancelScheduleBtn.classList.add("hidden");
+  }
+
+  updateScheduleInfo();
+}
+
+function updateScheduleInfo() {
+  if (state.scheduleAt) {
+    const remaining = state.scheduleAt - Date.now();
+    const when = new Date(state.scheduleAt).toLocaleString("ru-RU");
+    ui.optimizationScheduleInfo.classList.remove("hidden");
+    ui.optimizationScheduleInfo.innerHTML =
+      `<span class="schedule-dot"></span>` +
+      `<span>Запуск запланирован на <b>${when}</b> &nbsp; ` +
+      `До запуска: <span class="schedule-countdown">${formatCountdown(remaining)}</span></span>` +
+      `<button type="button" class="btn schedule-info-cancel">Отменить</button>`;
+  } else if (state.savedScheduleAt) {
+    const when = new Date(state.savedScheduleAt).toLocaleString("ru-RU");
+    ui.optimizationScheduleInfo.classList.remove("hidden");
+    ui.optimizationScheduleInfo.innerHTML =
+      `<span class="schedule-dot"></span>` +
+      `<span>Время запуска сохранено: <b>${when}</b>. Нажмите «Play», чтобы запустить по времени.</span>` +
+      `<button type="button" class="btn schedule-info-cancel">Отменить</button>`;
+  } else {
+    ui.optimizationScheduleInfo.classList.add("hidden");
+    ui.optimizationScheduleInfo.innerHTML = "";
+    return;
+  }
+  const cancelBtn = ui.optimizationScheduleInfo.querySelector(".schedule-info-cancel");
+  if (cancelBtn) cancelBtn.onclick = cancelSchedule;
+}
+
+async function triggerScheduledRun() {
+  const snapshot = state.scheduleSnapshot;
+  state.savedScheduleAt = null;
+  clearSchedule();
+  updateScheduleView();
+  if (!snapshot) return;
+  switchTab("optimization");
+  await runOptimization(snapshot.cardIds, snapshot.threads);
+}
+
+function openScheduleModal() {
+  if (state.savedScheduleAt) {
+    ui.scheduleDateTimeInput.value = toLocalInputValue(new Date(state.savedScheduleAt));
+  } else {
+    const defaultDate = new Date(Date.now() + 60 * 60 * 1000);
+    ui.scheduleDateTimeInput.value = toLocalInputValue(defaultDate);
+  }
+  updateScheduleView();
+  ui.scheduleModal.classList.remove("hidden");
+}
+
+function confirmSchedule() {
+  const value = ui.scheduleDateTimeInput.value;
+  if (!value) {
+    state.savedScheduleAt = null;
+    clearSchedule();
+    updateScheduleView();
+    ui.scheduleModal.classList.add("hidden");
+    return;
+  }
+
+  const target = new Date(value);
+  const timestamp = target.getTime();
+  if (!Number.isFinite(timestamp) || timestamp <= Date.now()) {
+    alert("Дата и время запуска должны быть в будущем.");
+    return;
+  }
+
+  clearSchedule();
+  state.savedScheduleAt = timestamp;
+  updateScheduleView();
+  ui.scheduleModal.classList.add("hidden");
+}
+
+function resetSchedule() {
+  ui.scheduleDateTimeInput.value = "";
+  state.savedScheduleAt = null;
+  clearSchedule();
+  updateScheduleView();
+  ui.scheduleDateTimeInput.focus();
+}
+
+function cancelSchedule() {
+  state.savedScheduleAt = null;
+  clearSchedule();
+  updateScheduleView();
+}
+
+ui.openScheduleBtn.onclick = openScheduleModal;
+ui.confirmScheduleBtn.onclick = confirmSchedule;
+ui.resetScheduleBtn.onclick = resetSchedule;
+ui.scheduleDateTimeInput.oninput = updateScheduleView;
+ui.cancelScheduleBtn.onclick = cancelSchedule;
+ui.closeScheduleBtn.onclick = () => ui.scheduleModal.classList.add("hidden");
+ui.scheduleModal.onclick = (event) => {
+  if (event.target === ui.scheduleModal) {
+    ui.scheduleModal.classList.add("hidden");
   }
 };
 

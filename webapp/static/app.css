@@ -345,6 +345,130 @@ input[type="number"] {
   }
 }
 
+.icon-btn.scheduled {
+  border-color: #2fbf68;
+  color: #d8ffe9;
+  box-shadow: 0 0 0 2px rgba(47, 191, 104, 0.25), 0 0 12px rgba(47, 191, 104, 0.35);
+  animation: schedulePulse 1.8s ease-in-out infinite;
+}
+@keyframes schedulePulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(47, 191, 104, 0.22), 0 0 8px rgba(47, 191, 104, 0.28); }
+  50% { box-shadow: 0 0 0 2px rgba(47, 191, 104, 0.4), 0 0 16px rgba(47, 191, 104, 0.5); }
+}
+
+.schedule-modal-content {
+  width: min(440px, 96vw);
+  gap: 14px;
+}
+.schedule-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+.schedule-icon {
+  font-size: 26px;
+  line-height: 1;
+  width: 48px;
+  height: 48px;
+  flex: 0 0 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  background: linear-gradient(180deg, #1c1c1c, #121212);
+  border: 1px solid #3a3a3a;
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.06);
+}
+.schedule-head h3 { margin: 0 0 4px; }
+.schedule-hint {
+  margin: 0;
+  color: #9aa0a6;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.schedule-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: #c6c6c6;
+  font-weight: 600;
+}
+.schedule-field-row {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.schedule-field-row input[type="datetime-local"] {
+  flex: 1;
+  min-width: 0;
+}
+.schedule-field-row .btn {
+  flex: 0 0 auto;
+  font-weight: 600;
+}
+.schedule-note {
+  color: #9aa0a6;
+  font-size: 12px;
+  font-weight: 400;
+}
+input[type="datetime-local"] {
+  background: #151515;
+  border: 1px solid #333;
+  color: #f1f1f1;
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 15px;
+  color-scheme: dark;
+}
+input[type="datetime-local"]:focus {
+  outline: none;
+  border-color: #2fbf68;
+  box-shadow: 0 0 0 2px rgba(47, 191, 104, 0.18);
+}
+.schedule-summary {
+  border: 1px solid #2f2f2f;
+  border-radius: 10px;
+  background: #121212;
+  padding: 10px 12px;
+  color: #cfcfcf;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.schedule-status,
+.schedule-info {
+  border: 1px solid rgba(47, 191, 104, 0.4);
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(47, 191, 104, 0.12), rgba(47, 191, 104, 0.04));
+  padding: 12px 14px;
+  color: #e8ffe8;
+  font-size: 13px;
+  line-height: 1.6;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.schedule-info { margin-top: 10px; }
+.schedule-info-cancel {
+  margin-left: auto;
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+.schedule-dot {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 10px;
+  border-radius: 50%;
+  background: #2fbf68;
+  box-shadow: 0 0 0 4px rgba(47, 191, 104, 0.2);
+  animation: schedulePulse 1.6s ease-in-out infinite;
+}
+.schedule-countdown {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+.schedule-cancel-btn { margin-right: auto; }
+
 .init-screen {
   position: fixed;
   inset: 0;
