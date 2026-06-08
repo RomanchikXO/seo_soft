@@ -188,6 +188,18 @@ def test_api_optimization_run_uses_selected_cards_and_flags(tmp_path: Path) -> N
                 "search_transitions": 2,
                 "maps_transitions": 4,
                 "coordinates": " 37.631182, 55.771363 ",
+                "competitor_open_chance_percent": 45,
+                "max_open_competitor_cards": 3,
+                "min_sleep_competitor_card_sec": 2,
+                "max_sleep_competitor_card_sec": 6,
+                "min_sleep_target_tab_sec": 1,
+                "max_sleep_target_tab_sec": 4,
+                "click_show_phone": 2,
+                "click_website": 1,
+                "click_route": 3,
+                "click_messengers": 2,
+                "click_book_story": 1,
+                "map_zoom_clicks": 5,
             },
         )
 
@@ -208,6 +220,18 @@ def test_api_optimization_run_uses_selected_cards_and_flags(tmp_path: Path) -> N
         assert card_b_payload["search_target"] == 2
         assert card_b_payload["maps_target"] == 4
         assert card_b_payload["coordinates"] == "37.631182, 55.771363"
+        assert card_b_payload["competitor_open_chance_percent"] == 45
+        assert card_b_payload["max_open_competitor_cards"] == 3
+        assert card_b_payload["min_sleep_competitor_card_sec"] == 2
+        assert card_b_payload["max_sleep_competitor_card_sec"] == 6
+        assert card_b_payload["min_sleep_target_tab_sec"] == 1
+        assert card_b_payload["max_sleep_target_tab_sec"] == 4
+        assert card_b_payload["click_show_phone"] == 2
+        assert card_b_payload["click_website"] == 1
+        assert card_b_payload["click_route"] == 3
+        assert card_b_payload["click_messengers"] == 2
+        assert card_b_payload["click_book_story"] == 1
+        assert card_b_payload["map_zoom_clicks"] == 5
         assert card_a_payload["keys"][0]["search_enabled"] is True
         assert card_b_payload["keys"][0]["maps_enabled"] is True
 

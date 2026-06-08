@@ -147,17 +147,30 @@ class SearchRunnerService:
         return self._build_optimization_summary(card_results)
 
     def _empty_card_result(self, card_payload: dict[str, object]) -> dict[str, object]:
-        """Создает начальную строку результата оптимизации для одной карточки."""
+        """Создает начальную строку результата оптимизации для одной карточки.
+
+        Цель по режиму учитывается только если по нему есть включённые ключи
+        (стоит чекбокс). Иначе режим вообще не выполняется и не должен числиться
+        как «не выполнено».
+        """
+        keys = self._card_key_payloads(card_payload)
+        has_search_keys = any(bool(key.get("search_enabled")) for key in keys)
+        has_maps_keys = any(bool(key.get("maps_enabled")) for key in keys)
+
+        search_target = self._to_non_negative_int(card_payload.get("search_target", 0)) if has_search_keys else 0
+        maps_target = self._to_non_negative_int(card_payload.get("maps_target", 0)) if has_maps_keys else 0
+
         return {
             "card_id": int(card_payload.get("card_id", 0)),
             "card_name": str(card_payload.get("card_name", "")),
             "organization": str(card_payload.get("organization", "")),
-            "search_target": self._to_non_negative_int(card_payload.get("search_target", 0)),
+            "search_target": search_target,
             "search_performed": 0,
             "search_effect_keys": [],
-            "maps_target": self._to_non_negative_int(card_payload.get("maps_target", 0)),
+            "maps_target": maps_target,
             "maps_performed": 0,
             "maps_effect_keys": [],
+            "maps_action_counts": {},
         }
 
     def _build_target_states(self, prepared_cards: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -192,6 +205,7 @@ class SearchRunnerService:
                         "performed": 0,
                         "in_flight": 0,
                         "effect_key_ids": set(),
+                        "action_counts": {},
                     }
                 )
         return targets
@@ -256,10 +270,17 @@ class SearchRunnerService:
         """Учитывает результат одного завершенного действия (в главном потоке планировщика)."""
         state["in_flight"] -= 1
         try:
-            effect = bool(future.result())
+            result = self._normalize_action_result(future.result())
         except Exception as error:
-            effect = False
+            result = {"effect": False, "actions": {}}
             self._log(f"Карточка #{state['card_id']}: действие {state['mode']} упало с ошибкой {error}.")
+
+        effect = bool(result["effect"])
+        for action_label, count in result["actions"].items():
+            if count:
+                state["action_counts"][action_label] = (
+                    state["action_counts"].get(action_label, 0) + int(count)
+                )
 
         if effect:
             if state["performed"] < state["target"]:
@@ -281,11 +302,28 @@ class SearchRunnerService:
                     f"Карточка #{state['card_id']}: {state['mode']} — закончились результативные ключи."
                 )
 
-    def _execute_single_action(self, state: dict[str, object], key_payload: dict[str, object]) -> bool:
+    def _execute_single_action(
+        self, state: dict[str, object], key_payload: dict[str, object]
+    ) -> dict[str, object]:
         """Выполняет одно действие по ключу в зависимости от режима цели."""
         if state["mode"] == "search":
-            return self._simulate_search_action(key_payload, state["card_payload"])
-        return self._simulate_browser_action_one_second(key_payload, state["card_payload"])
+            return self._normalize_action_result(
+                self._simulate_search_action(key_payload, state["card_payload"])
+            )
+        return self._normalize_action_result(
+            self._simulate_browser_action_one_second(key_payload, state["card_payload"])
+        )
+
+    @staticmethod
+    def _normalize_action_result(raw: object) -> dict[str, object]:
+        """Приводит результат действия к виду {'effect': bool, 'actions': dict}."""
+        if isinstance(raw, dict):
+            actions = raw.get("actions") or {}
+            return {
+                "effect": bool(raw.get("effect")),
+                "actions": dict(actions) if isinstance(actions, dict) else {},
+            }
+        return {"effect": bool(raw), "actions": {}}
 
     @staticmethod
     def _card_key_payloads(card_payload: dict[str, object]) -> list[dict[str, object]]:
@@ -302,6 +340,11 @@ class SearchRunnerService:
         mode = state["mode"]
         card_entry[f"{mode}_performed"] = int(state["performed"])
         card_entry[f"{mode}_effect_keys"] = sorted(state["effect_key_ids"])
+        if mode == "maps":
+            merged: dict[str, int] = dict(card_entry.get("maps_action_counts", {}))
+            for action_label, count in state.get("action_counts", {}).items():
+                merged[action_label] = merged.get(action_label, 0) + int(count)
+            card_entry["maps_action_counts"] = merged
 
     def _build_optimization_summary(self, card_results: dict[int, dict[str, object]]) -> dict[str, object]:
         """Собирает итоговый ответ оптимизации по всем карточкам."""
@@ -315,9 +358,18 @@ class SearchRunnerService:
                 "maps_performed",
             )
         }
+        total_action_counts: dict[str, int] = {}
+        for item in results:
+            action_counts = item.get("maps_action_counts", {})
+            if not isinstance(action_counts, dict):
+                continue
+            for action_label, count in action_counts.items():
+                total_action_counts[action_label] = total_action_counts.get(action_label, 0) + int(count)
+
         self._log(
             f"Оптимизация завершена. search={totals['search_performed']}/{totals['search_target']}, "
-            f"maps={totals['maps_performed']}/{totals['maps_target']}"
+            f"maps={totals['maps_performed']}/{totals['maps_target']}, "
+            f"действия={total_action_counts}"
         )
         return {
             "processed_cards": len(results),
@@ -325,6 +377,7 @@ class SearchRunnerService:
             "total_search_performed": totals["search_performed"],
             "total_maps_target": totals["maps_target"],
             "total_maps_performed": totals["maps_performed"],
+            "total_action_counts": total_action_counts,
             "cards": results,
         }
 
@@ -752,19 +805,42 @@ class SearchRunnerService:
         self,
         key_payload: dict[str, object],
         card_payload: dict[str, object],
-    ) -> bool:
+    ) -> dict[str, object]:
         """Открывает Яндекс.Карты и выполняет там запрос (только по фразе/ключу)."""
         phrase = str(key_payload.get("phrase", ""))
         query = phrase.strip()
         if not query:
             self._log("simulate_maps_action: пустой запрос, пропуск.")
-            return False
+            return {"effect": False, "actions": {}}
 
-        maps_wait_after_input_ms = 15000
+        map_zoom_clicks = self._to_non_negative_int(card_payload.get("map_zoom_clicks", 0))
+        competitor_open_chance_percent = max(
+            0,
+            min(100, self._to_non_negative_int(card_payload.get("competitor_open_chance_percent", 0))),
+        )
+        max_open_competitor_cards = self._to_non_negative_int(card_payload.get("max_open_competitor_cards", 0))
+        min_sleep_competitor_card_sec = self._to_non_negative_int(
+            card_payload.get("min_sleep_competitor_card_sec", 0)
+        )
+        max_sleep_competitor_card_sec = self._to_non_negative_int(
+            card_payload.get("max_sleep_competitor_card_sec", 0)
+        )
+        if max_sleep_competitor_card_sec < min_sleep_competitor_card_sec:
+            max_sleep_competitor_card_sec = min_sleep_competitor_card_sec
+        min_sleep_target_tab_sec = self._to_non_negative_int(card_payload.get("min_sleep_target_tab_sec", 0))
+        max_sleep_target_tab_sec = self._to_non_negative_int(card_payload.get("max_sleep_target_tab_sec", 0))
+        if max_sleep_target_tab_sec < min_sleep_target_tab_sec:
+            max_sleep_target_tab_sec = min_sleep_target_tab_sec
+        click_show_phone = self._to_non_negative_int(card_payload.get("click_show_phone", 0))
+        click_website = self._to_non_negative_int(card_payload.get("click_website", 0))
+        click_route = self._to_non_negative_int(card_payload.get("click_route", 0))
+        click_messengers = self._to_non_negative_int(card_payload.get("click_messengers", 0))
+        click_book_story = self._to_non_negative_int(card_payload.get("click_book_story", 0))
         self._log(f"simulate_maps_action: старт для запроса '{query}'.")
         maps_url = self._build_maps_url(card_payload)
         browsers_path = self._prepare_runtime_browsers_path()
         try:
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
             from playwright.sync_api import sync_playwright
 
             with sync_playwright() as playwright:
@@ -783,30 +859,66 @@ class SearchRunnerService:
                     page.wait_for_timeout(1000)
                 
                 organization = str(card_payload.get("organization", ""))
-                found = self._find_and_open_maps_organization(page, organization, maps_wait_after_input_ms)
-                
+                found = self._find_and_open_maps_organization(
+                    page,
+                    organization,
+                    map_zoom_clicks,
+                    PlaywrightTimeoutError,
+                )
+
+                action_counts: dict[str, int] = {}
                 if not found:
-                    self._log("simulate_maps_action: организация не найдена на картах, жду 15 секунд.")
-                    page.wait_for_timeout(maps_wait_after_input_ms)
+                    self._log("simulate_maps_action: организация не найдена на картах.")
+                else:
+                    action_counts = self._run_maps_card_activity(
+                        page,
+                        click_show_phone=click_show_phone,
+                        click_website=click_website,
+                        click_route=click_route,
+                        click_messengers=click_messengers,
+                        click_book_story=click_book_story,
+                        min_sleep_target_tab_sec=min_sleep_target_tab_sec,
+                        max_sleep_target_tab_sec=max_sleep_target_tab_sec,
+                    )
+                    self._run_competitor_card_activity(
+                        page,
+                        chance_percent=competitor_open_chance_percent,
+                        max_open_cards=max_open_competitor_cards,
+                        min_sleep_sec=min_sleep_competitor_card_sec,
+                        max_sleep_sec=max_sleep_competitor_card_sec,
+                    )
 
                 self._close_browser_session(context, browser, "simulate_browser_action_one_second")
             self._log("simulate_maps_action: завершено успешно.")
-            return True
+            return {"effect": True, "actions": action_counts}
         except Exception as error:
             self._log(f"simulate_maps_action: ошибка {error}")
-            return False
+            return {"effect": False, "actions": {}}
 
     def _find_and_open_maps_organization(
         self,
         page,
         organization: str,
-        maps_wait_after_input_ms: int,
+        map_zoom_clicks: int,
+        timeout_error_type,
     ) -> bool:
         """Ищет целевую организацию в списке на странице Яндекс.Карт и кликает по ней."""
         if not organization:
             self._log("simulate_maps_action: название организации пустое, поиск в списке невозможен.")
             return False
 
+        if self._find_and_open_maps_organization_in_list(page, organization):
+            return True
+        for step in range(map_zoom_clicks):
+            self._log(f"simulate_maps_action: zoom-итерация в картах {step + 1}/{map_zoom_clicks}.")
+            self._apply_zoom_step(page, step, timeout_error_type)
+            if self._find_and_open_maps_organization_in_list(page, organization):
+                self._log("simulate_maps_action: организация найдена после zoom-итерации в картах.")
+                return True
+        return False
+
+    def _find_and_open_maps_organization_in_list(self, page, organization: str) -> bool:
+        """Ищет и открывает карточку организации в текущем списке результатов карт."""
         try:
             page.locator("ul.search-list-view__list").first.wait_for(state="visible", timeout=5000)
         except Exception:
@@ -826,31 +938,628 @@ class SearchRunnerService:
                 if title_locator.count() == 0:
                     continue
                 actual_title = title_locator.inner_text().strip()
-                if organization.lower() in actual_title.lower():
-                    self._log(f"simulate_maps_action: найдена организация '{actual_title}'.")
-                    page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
-                    
-                    try:
-                        title_locator.click(force=True)
-                    except Exception:
-                        pass
-                    
-                    self._handle_captcha_if_present(page, wait_ms=3000, context="после открытия карточки организации на картах")
-                    self._log("simulate_maps_action: жду 15 секунд после открытия карточки в картах.")
-                    page.wait_for_timeout(maps_wait_after_input_ms)
-                    return True
+                if organization.lower() not in actual_title.lower():
+                    continue
+                self._log(f"simulate_maps_action: найдена организация '{actual_title}'.")
+                page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
+                try:
+                    title_locator.click(force=True)
+                except Exception:
+                    return False
+                self._handle_captcha_if_present(
+                    page,
+                    wait_ms=3000,
+                    context="после открытия карточки организации на картах",
+                )
+                return True
 
             items.nth(count - 1).scroll_into_view_if_needed()
             page.wait_for_timeout(random.randint(1000, 1500))
             new_count = items.count()
-            
             if new_count == count:
                 retries += 1
             else:
                 retries = 0
                 last_count = count
-
         return False
+
+    def _run_maps_card_activity(
+        self,
+        page,
+        *,
+        click_show_phone: int,
+        click_website: int,
+        click_route: int,
+        click_messengers: int,
+        click_book_story: int,
+        min_sleep_target_tab_sec: int,
+        max_sleep_target_tab_sec: int,
+    ) -> dict[str, int]:
+        """Выполняет целевые действия в карточке на картах в случайном порядке/объеме.
+
+        Возвращает словарь {действие: число успешно выполненных} для статистики.
+        """
+        max_attempt_plan = [
+            ("Показать телефон", click_show_phone),
+            ("Сайт", click_website),
+            ("Маршрут", click_route),
+            ("мессенджер", click_messengers),
+            ("Записаться", click_book_story),
+        ]
+        click_plan = self._build_random_maps_action_plan(max_attempt_plan)
+        action_counts: dict[str, int] = {}
+        for action_label, attempts in click_plan:
+            performed = self._perform_maps_action_clicks(
+                page,
+                action_label,
+                attempts,
+                min_sleep_target_tab_sec=min_sleep_target_tab_sec,
+                max_sleep_target_tab_sec=max_sleep_target_tab_sec,
+            )
+            if performed:
+                action_counts[action_label] = action_counts.get(action_label, 0) + performed
+        self._sleep_in_range_seconds(
+            page,
+            min_sleep_target_tab_sec,
+            max_sleep_target_tab_sec,
+            "simulate_maps_action: нахожусь в целевой карточке",
+        )
+        return action_counts
+
+    @staticmethod
+    def _build_random_maps_action_plan(max_attempt_plan: list[tuple[str, int]]) -> list[tuple[str, int]]:
+        """Строит случайный план: порядок действий и число попыток для каждого.
+
+        Каждое включённое действие (max>0) получает случайное число попыток в [0..max].
+        При этом гарантируется, что план не будет пустым: если все выпали в 0,
+        одно случайное включённое действие получит хотя бы одну попытку.
+        """
+        enabled = [
+            (action_label, max(0, int(max_attempts)))
+            for action_label, max_attempts in max_attempt_plan
+            if max(0, int(max_attempts)) > 0
+        ]
+        plan: list[tuple[str, int]] = []
+        for action_label, safe_max in enabled:
+            planned_attempts = random.randint(0, safe_max)
+            if planned_attempts <= 0:
+                continue
+            plan.append((action_label, planned_attempts))
+
+        if not plan and enabled:
+            action_label, safe_max = random.choice(enabled)
+            plan.append((action_label, random.randint(1, safe_max)))
+
+        random.shuffle(plan)
+        return plan
+
+    def _run_competitor_card_activity(
+        self,
+        page,
+        *,
+        chance_percent: int,
+        max_open_cards: int,
+        min_sleep_sec: int,
+        max_sleep_sec: int,
+    ) -> None:
+        """Иногда открывает карточки конкурентов и задерживается на них."""
+        if max_open_cards <= 0 or chance_percent <= 0:
+            return
+        roll = random.randint(1, 100)
+        if roll > chance_percent:
+            self._log(
+                f"simulate_maps_action: карточки конкурентов пропущены (шанс={chance_percent}%, roll={roll})."
+            )
+            return
+
+        items = page.locator("li.search-snippet-view")
+        count = items.count()
+        if count <= 1:
+            return
+        open_limit = min(max_open_cards, max(0, count - 1))
+        for index in range(1, open_limit + 1):
+            item_locator = items.nth(index)
+            title_locator = item_locator.locator(".search-business-snippet-view__title").first
+            if title_locator.count() == 0:
+                continue
+            try:
+                title = title_locator.inner_text().strip()
+            except Exception:
+                title = ""
+            try:
+                title_locator.click(force=True)
+            except Exception:
+                continue
+            self._handle_captcha_if_present(
+                page,
+                wait_ms=2500,
+                context=f"после открытия карточки конкурента #{index}",
+            )
+            self._log(
+                f"simulate_maps_action: открыта карточка конкурента {index}/{open_limit} '{title}'."
+            )
+            self._sleep_in_range_seconds(
+                page,
+                min_sleep_sec,
+                max_sleep_sec,
+                "simulate_maps_action: нахожусь в карточке конкурента",
+            )
+
+    def _perform_maps_action_clicks(
+        self,
+        page,
+        action_label: str,
+        attempts: int,
+        *,
+        min_sleep_target_tab_sec: int = 0,
+        max_sleep_target_tab_sec: int = 0,
+    ) -> int:
+        """Пытается кликнуть по кнопкам действий в карточке. Возвращает число успехов."""
+        if attempts <= 0:
+            return 0
+        if action_label == "Сайт":
+            return self._perform_maps_website_clicks(
+                page,
+                attempts,
+                min_sleep_target_tab_sec=min_sleep_target_tab_sec,
+                max_sleep_target_tab_sec=max_sleep_target_tab_sec,
+            )
+        if action_label == "Показать телефон":
+            return self._perform_maps_phone_clicks(
+                page,
+                attempts,
+                min_sleep_target_tab_sec=min_sleep_target_tab_sec,
+                max_sleep_target_tab_sec=max_sleep_target_tab_sec,
+            )
+        if action_label == "Маршрут":
+            return self._perform_maps_route_clicks(
+                page,
+                attempts,
+                min_sleep_target_tab_sec=min_sleep_target_tab_sec,
+                max_sleep_target_tab_sec=max_sleep_target_tab_sec,
+            )
+        if action_label == "мессенджер":
+            return self._perform_maps_messenger_clicks(
+                page,
+                attempts,
+                min_sleep_target_tab_sec=min_sleep_target_tab_sec,
+                max_sleep_target_tab_sec=max_sleep_target_tab_sec,
+            )
+        if action_label == "Записаться":
+            return self._perform_maps_cta_clicks(
+                page,
+                attempts,
+                min_sleep_target_tab_sec=min_sleep_target_tab_sec,
+                max_sleep_target_tab_sec=max_sleep_target_tab_sec,
+            )
+        locator = self._maps_action_locator(page, action_label)
+        total = locator.count()
+        if total <= 0:
+            self._log(f"simulate_maps_action: действие '{action_label}' недоступно в карточке.")
+            return 0
+
+        success = 0
+        for _ in range(attempts):
+            if locator.count() <= 0:
+                break
+            try:
+                target = locator.first
+                target.click(force=True)
+                success += 1
+                page.wait_for_timeout(random.randint(400, 1200))
+                self._handle_captcha_if_present(
+                    page,
+                    wait_ms=1500,
+                    context=f"после клика '{action_label}'",
+                )
+            except Exception:
+                continue
+        self._log(
+            f"simulate_maps_action: клики '{action_label}' выполнены {success}/{attempts}."
+        )
+        return success
+
+    @staticmethod
+    def _maps_action_locator(page, action_label: str):
+        """Возвращает locator для кликов по стандартным действиям карточки."""
+        if action_label == "Показать телефон":
+            return page.locator(
+                "div.card-phones-view__more-wrapper[role='button'], "
+                "div.card-phones-view__more-wrapper, "
+                "[role='button']:has(.card-phones-view__more), "
+                "[role='button']:has-text('Показать телефон')"
+            )
+        if action_label == "Маршрут":
+            return page.locator(
+                "button[role='button']:has-text('Маршрут'), button:has-text('Маршрут'), "
+                "a:has-text('Маршрут'), [role='link']:has-text('Маршрут')"
+            )
+        return page.locator(f"button:has-text('{action_label}'), a:has-text('{action_label}')")
+
+    def _perform_maps_website_clicks(
+        self,
+        page,
+        attempts: int,
+        *,
+        min_sleep_target_tab_sec: int = 0,
+        max_sleep_target_tab_sec: int = 0,
+    ) -> int:
+        """Кликает по ссылке сайта в блоке контактов, если сайт указан у организации."""
+        locator = page.locator("a[itemprop='url'][href]")
+        total = locator.count()
+        if total <= 0:
+            self._log("simulate_maps_action: сайт в контактах отсутствует, клики 'Сайт' пропущены.")
+            return 0
+
+        success = 0
+        for _ in range(attempts):
+            if locator.count() <= 0:
+                break
+            previous_url = getattr(page, "url", "")
+            pages_before = self._count_context_pages(page)
+            try:
+                locator.first.click(force=True)
+                success += 1
+                page.wait_for_timeout(random.randint(400, 1200))
+                self._close_new_tab_if_opened(
+                    page,
+                    pages_before,
+                    "Сайт",
+                    min_sleep_target_tab_sec=min_sleep_target_tab_sec,
+                    max_sleep_target_tab_sec=max_sleep_target_tab_sec,
+                )
+                self._handle_captcha_if_present(
+                    page,
+                    wait_ms=1500,
+                    context="после клика 'Сайт'",
+                )
+                self._restore_maps_page_after_action(page, previous_url, "Сайт")
+            except Exception:
+                continue
+        self._log(f"simulate_maps_action: клики 'Сайт' выполнены {success}/{attempts}.")
+        return success
+
+    def _perform_maps_phone_clicks(
+        self,
+        page,
+        attempts: int,
+        *,
+        min_sleep_target_tab_sec: int = 0,
+        max_sleep_target_tab_sec: int = 0,
+    ) -> int:
+        """Кликает по 'Показать телефон' и засчитывает только подтвержденное раскрытие."""
+        success = 0
+        for _ in range(attempts):
+            before_count = self._count_show_phone_controls(page)
+            visible_phone_before = self._count_visible_phone_values(page)
+            if before_count <= 0:
+                break
+
+            locator = self._maps_action_locator(page, "Показать телефон")
+            if locator.count() <= 0:
+                break
+            try:
+                locator.first.click(force=True)
+                page.wait_for_timeout(random.randint(400, 1200))
+                self._handle_captcha_if_present(
+                    page,
+                    wait_ms=1200,
+                    context="после клика 'Показать телефон'",
+                )
+                after_count = self._count_show_phone_controls(page)
+                visible_phone_after = self._count_visible_phone_values(page)
+                # Успех: контрол раскрылся, либо телефон уже был видим и клик выполнен.
+                if (
+                    after_count < before_count
+                    or visible_phone_after > visible_phone_before
+                    or visible_phone_before > 0
+                ):
+                    success += 1
+                    self._sleep_in_range_seconds(
+                        page,
+                        min_sleep_target_tab_sec,
+                        max_sleep_target_tab_sec,
+                        "simulate_maps_action: пауза после 'Показать телефон'",
+                    )
+            except Exception:
+                continue
+        self._log(f"simulate_maps_action: клики 'Показать телефон' выполнены {success}/{attempts}.")
+        return success
+
+    @staticmethod
+    def _count_show_phone_controls(page) -> int:
+        """Возвращает число видимых контролов с текстом 'Показать телефон'."""
+        locator = page.locator(
+            "div.card-phones-view__more-wrapper, "
+            "div.card-phones-view__more:has-text('Показать телефон'), "
+            "[role='button']:has-text('Показать телефон')"
+        )
+        return locator.count()
+
+    @staticmethod
+    def _count_visible_phone_values(page) -> int:
+        """Возвращает количество видимых значений телефона в карточке."""
+        return page.locator("[itemprop='telephone']").count()
+
+    def _perform_maps_route_clicks(
+        self,
+        page,
+        attempts: int,
+        *,
+        min_sleep_target_tab_sec: int = 0,
+        max_sleep_target_tab_sec: int = 0,
+    ) -> int:
+        """Устойчиво кликает по кнопке 'Маршрут' через несколько безопасных локаторов."""
+        locators = [
+            page.locator("button[role='button']:has-text('Маршрут')"),
+            page.locator("[role='button']:has-text('Маршрут')"),
+            page.locator("button:has-text('Маршрут')"),
+        ]
+        if all(locator.count() <= 0 for locator in locators):
+            self._log("simulate_maps_action: действие 'Маршрут' недоступно в карточке.")
+            return 0
+
+        success = 0
+        for _ in range(attempts):
+            clicked = False
+            for locator in locators:
+                if locator.count() <= 0:
+                    continue
+                target = locator.first
+                previous_url = getattr(page, "url", "")
+                try:
+                    target.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    target.click(timeout=3000)
+                    clicked = True
+                except Exception:
+                    try:
+                        target.click(force=True, timeout=3000)
+                        clicked = True
+                    except Exception:
+                        continue
+                if clicked:
+                    success += 1
+                    page.wait_for_timeout(random.randint(400, 1200))
+                    self._sleep_in_range_seconds(
+                        page,
+                        min_sleep_target_tab_sec,
+                        max_sleep_target_tab_sec,
+                        "simulate_maps_action: пауза после 'Маршрут'",
+                    )
+                    self._handle_captcha_if_present(
+                        page,
+                        wait_ms=1500,
+                        context="после клика 'Маршрут'",
+                    )
+                    self._restore_maps_page_after_action(page, previous_url, "Маршрут")
+                    break
+        self._log(f"simulate_maps_action: клики 'Маршрут' выполнены {success}/{attempts}.")
+        return success
+
+    def _perform_maps_messenger_clicks(
+        self,
+        page,
+        attempts: int,
+        *,
+        min_sleep_target_tab_sec: int = 0,
+        max_sleep_target_tab_sec: int = 0,
+    ) -> int:
+        """Выбирает один случайный мессенджер и кликает по нему заданное число раз."""
+        locator = page.locator("a[itemprop='sameAs'][href]")
+        total = locator.count()
+        if total <= 0:
+            self._log("simulate_maps_action: соцсети/мессенджеры в контактах отсутствуют.")
+            return 0
+
+        selected_index = random.randint(0, total - 1)
+        self._log(
+            f"simulate_maps_action: выбран мессенджер/соцсеть #{selected_index + 1} из {total}."
+        )
+        success = 0
+        for _ in range(attempts):
+            available = locator.count()
+            if available <= 0:
+                break
+            previous_url = getattr(page, "url", "")
+            pages_before = self._count_context_pages(page)
+            try:
+                target = locator.nth(min(selected_index, available - 1))
+                target.click(force=True)
+                success += 1
+                page.wait_for_timeout(random.randint(400, 1200))
+                self._close_new_tab_if_opened(
+                    page,
+                    pages_before,
+                    "мессенджер",
+                    min_sleep_target_tab_sec=min_sleep_target_tab_sec,
+                    max_sleep_target_tab_sec=max_sleep_target_tab_sec,
+                )
+                self._handle_captcha_if_present(
+                    page,
+                    wait_ms=1500,
+                    context="после клика в мессенджер/соцсеть",
+                )
+                self._restore_maps_page_after_action(page, previous_url, "мессенджер")
+            except Exception:
+                continue
+        self._log(f"simulate_maps_action: клики в мессенджеры выполнены {success}/{attempts}.")
+        return success
+
+    # Текстовые исключения для не-CTA действий (Маршрут/Показать телефон тоже имеют action-button-view__icon).
+    _NON_CTA_TEXT_EXCLUDES = ":not(:has-text('Маршрут')):not(:has-text('Показать телефон'))"
+
+    @staticmethod
+    def _maps_cta_locator(page):
+        """Locator CTA-кнопки заведения (Забронировать/Заказать/Записаться) с приоритетом точных признаков."""
+        excludes = SearchRunnerService._NON_CTA_TEXT_EXCLUDES
+
+        # 1) Точный контейнер призыва к действию — только CTA-кнопки заведения.
+        container_locator = page.locator(
+            ".business-card-title-view__call-to-action [role='button']"
+        )
+        if container_locator.count() > 0:
+            return container_locator
+
+        # 2) Стиль "announcement" — устойчивый признак CTA (в отличие от _view_primary у "Маршрут").
+        announcement_locator = page.locator(
+            "button._view_announcement[role='button'], a._view_announcement[role='button'], "
+            "button._view_announcement, a._view_announcement"
+        )
+        if announcement_locator.count() > 0:
+            return announcement_locator
+
+        # 3) Якорь на иконку action-button, но исключая стандартные не-CTA действия.
+        icon_locator = page.locator(
+            f"button:has(.action-button-view__icon){excludes}, "
+            f"a:has(.action-button-view__icon){excludes}, "
+            f"[role='button']:has(.action-button-view__icon){excludes}"
+        )
+        if icon_locator.count() > 0:
+            return icon_locator
+
+        # 4) Семантический фолбэк по внешней ссылке-кнопке (исключая сайт/мессенджеры).
+        semantic_locator = page.locator(
+            "a[role='button'][target='_blank'][rel*='nofollow']:not([itemprop='url']):not([itemprop='sameAs'])"
+        )
+        if semantic_locator.count() > 0:
+            return semantic_locator
+
+        # 5) Широкий фолбэк по кнопке, исключая явные не-CTA действия.
+        return page.locator(f"button[role='button']{excludes}")
+
+    def _perform_maps_cta_clicks(
+        self,
+        page,
+        attempts: int,
+        *,
+        min_sleep_target_tab_sec: int = 0,
+        max_sleep_target_tab_sec: int = 0,
+    ) -> int:
+        """Кликает по CTA-кнопке заведения. Якоримся на стабильный контейнер CTA."""
+        locator = self._maps_cta_locator(page)
+        total = locator.count()
+        if total <= 0:
+            self._log("simulate_maps_action: действие CTA недоступно в карточке.")
+            return 0
+
+        success = 0
+        for _ in range(attempts):
+            if locator.count() <= 0:
+                break
+            previous_url = getattr(page, "url", "")
+            pages_before = self._count_context_pages(page)
+            try:
+                locator.first.click(force=True)
+                success += 1
+                page.wait_for_timeout(random.randint(400, 1200))
+                self._close_new_tab_if_opened(
+                    page,
+                    pages_before,
+                    "CTA",
+                    min_sleep_target_tab_sec=min_sleep_target_tab_sec,
+                    max_sleep_target_tab_sec=max_sleep_target_tab_sec,
+                )
+                self._handle_captcha_if_present(
+                    page,
+                    wait_ms=1500,
+                    context="после клика CTA",
+                )
+                self._restore_maps_page_after_action(page, previous_url, "CTA")
+                self._sleep_in_range_seconds(
+                    page,
+                    min_sleep_target_tab_sec,
+                    max_sleep_target_tab_sec,
+                    "simulate_maps_action: пауза после CTA",
+                )
+            except Exception:
+                continue
+        self._log(f"simulate_maps_action: клики CTA выполнены {success}/{attempts}.")
+        return success
+
+    @staticmethod
+    def _count_context_pages(page) -> int:
+        """Возвращает число вкладок в текущем контексте, если доступно."""
+        context = getattr(page, "context", None)
+        if context is None:
+            return 0
+        pages = getattr(context, "pages", None)
+        if pages is None:
+            return 0
+        try:
+            return len(pages)
+        except Exception:
+            return 0
+
+    def _close_new_tab_if_opened(
+        self,
+        page,
+        pages_before: int,
+        action_label: str,
+        *,
+        min_sleep_target_tab_sec: int = 0,
+        max_sleep_target_tab_sec: int = 0,
+    ) -> None:
+        """Закрывает новую вкладку, если действие открыло внешний сайт/мессенджер."""
+        context = getattr(page, "context", None)
+        if context is None:
+            return
+        pages = getattr(context, "pages", None)
+        if pages is None:
+            return
+        try:
+            current_pages = list(pages)
+        except Exception:
+            return
+        if len(current_pages) <= pages_before:
+            return
+        for candidate in reversed(current_pages):
+            if candidate is page:
+                continue
+            try:
+                safe_min = max(0, min_sleep_target_tab_sec)
+                safe_max = max(safe_min, max_sleep_target_tab_sec)
+                if safe_max > 0:
+                    dwell_sec = random.randint(safe_min, safe_max)
+                    self._log(
+                        f"simulate_maps_action: новая вкладка '{action_label}' открыта, жду {dwell_sec} сек перед закрытием."
+                    )
+                    candidate.wait_for_timeout(dwell_sec * 1000)
+                candidate.close()
+                self._log(
+                    f"simulate_maps_action: закрыта новая вкладка после действия '{action_label}'."
+                )
+                return
+            except Exception:
+                continue
+
+    def _restore_maps_page_after_action(self, page, previous_url: str, action_label: str) -> None:
+        """Возвращает страницу назад, если действие увело из карточки в текущей вкладке."""
+        current_url = getattr(page, "url", "")
+        if not current_url or current_url == previous_url:
+            return
+        self._log(
+            f"simulate_maps_action: после '{action_label}' URL изменился, возвращаюсь назад."
+        )
+        try:
+            page.go_back(wait_until="domcontentloaded", timeout=5000)
+            page.wait_for_timeout(random.randint(600, 1200))
+        except Exception:
+            self._log(
+                f"simulate_maps_action: не удалось вернуться назад после '{action_label}'."
+            )
+
+    def _sleep_in_range_seconds(self, page, min_sec: int, max_sec: int, reason: str) -> None:
+        """Выдерживает паузу в заданном диапазоне секунд."""
+        safe_min = max(0, min_sec)
+        safe_max = max(safe_min, max_sec)
+        if safe_max <= 0:
+            return
+        sleep_sec = random.randint(safe_min, safe_max)
+        self._log(f"{reason}: {sleep_sec} сек.")
+        page.wait_for_timeout(sleep_sec * 1000)
 
     def _launch_chromium_with_recovery(self, playwright, browsers_path: Path):
         """Запускает браузер и переустанавливает Chromium, если исполняемый файл пропал."""
@@ -1207,7 +1916,6 @@ class SearchRunnerService:
 
     def _type_query_and_submit(self, page, search_input, query: str) -> None:
         """Фокусирует поле поиска, вводит запрос и отправляет его Enter."""
-        self._log("Фокусирую поле поиска и ввожу запрос.")
         search_input.click(timeout=5000)
         search_input.fill("")
         self._type_human_like(page, query, target_input=search_input)
@@ -1222,7 +1930,6 @@ class SearchRunnerService:
         self._log(f"Перед Enter в поле: '{typed_value[:80]}'")
         if not typed_value:
             raise RuntimeError("Поле поиска пустое перед отправкой Enter.")
-        self._log("Отправляю запрос клавишей Enter.")
         search_input.press("Enter")
 
     @staticmethod
