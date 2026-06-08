@@ -110,6 +110,15 @@ def test_notification_message_contains_statistics() -> None:
     assert "Переходы в поиске: <b>4/5</b>" in text
     assert "Переходы в карты: <b>1/3</b>" in text
     assert "Не выполнено действий: <b>3</b>" in text
+    assert "Поиск по организациям" in text
+    assert "Карты по организациям" in text
+    assert "Не удалось выполнить" in text
+    assert "<b>Кофейня</b>: поиск 3/3" in text
+    assert "<b>Кофейня</b>: карты 0/1" in text
+    assert "<b>Кофейня</b>: карты 1 (всего 1)" in text
+    assert "<b>Card B</b>: поиск 1/2" in text
+    assert "<b>Card B</b>: карты 1/2" in text
+    assert "<b>Card B</b>: поиск 1, карты 1 (всего 2)" in text
     assert "Кофейня" in text
     assert "Card B" in text
 

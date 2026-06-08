@@ -106,11 +106,31 @@ class NotificationService:
         ]
 
         cards = summary.get("cards", [])
-        card_lines = NotificationService._build_card_lines(cards if isinstance(cards, list) else [])
+        typed_cards = cards if isinstance(cards, list) else []
+        card_lines = NotificationService._build_card_lines(typed_cards)
+        search_lines = NotificationService._build_mode_lines(typed_cards, mode="search", label="поиск")
+        maps_lines = NotificationService._build_mode_lines(typed_cards, mode="maps", label="карты")
+        failed_lines = NotificationService._build_failed_lines(typed_cards)
+
         if card_lines:
             lines.append("")
             lines.append("<b>По организациям:</b>")
             lines.extend(card_lines)
+
+        if search_lines:
+            lines.append("")
+            lines.append("<b>🔍 Поиск по организациям:</b>")
+            lines.extend(search_lines)
+
+        if maps_lines:
+            lines.append("")
+            lines.append("<b>🗺 Карты по организациям:</b>")
+            lines.extend(maps_lines)
+
+        if failed_lines:
+            lines.append("")
+            lines.append("<b>⚠️ Не удалось выполнить:</b>")
+            lines.extend(failed_lines)
 
         return "\n".join(lines)
 
@@ -140,6 +160,51 @@ class NotificationService:
             suffix = f" — не выполнено {failed}" if failed else ""
             card_lines.append(f"• <b>{title}</b>: {', '.join(parts)}{suffix}")
         return card_lines
+
+    @staticmethod
+    def _build_mode_lines(cards: list[dict[str, object]], mode: str, label: str) -> list[str]:
+        lines: list[str] = []
+        done_key = f"{mode}_performed"
+        target_key = f"{mode}_target"
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            target = int(card.get(target_key, 0) or 0)
+            if target <= 0:
+                continue
+            done = int(card.get(done_key, 0) or 0)
+            title = str(card.get("organization") or card.get("card_name") or "Без названия").strip()
+            title = html.escape(title) or "Без названия"
+            lines.append(f"• <b>{title}</b>: {label} {done}/{target}")
+        return lines
+
+    @staticmethod
+    def _build_failed_lines(cards: list[dict[str, object]]) -> list[str]:
+        lines: list[str] = []
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            search_target = int(card.get("search_target", 0) or 0)
+            search_done = int(card.get("search_performed", 0) or 0)
+            maps_target = int(card.get("maps_target", 0) or 0)
+            maps_done = int(card.get("maps_performed", 0) or 0)
+
+            search_failed = max(0, search_target - search_done)
+            maps_failed = max(0, maps_target - maps_done)
+            total_failed = search_failed + maps_failed
+            if total_failed <= 0:
+                continue
+
+            title = str(card.get("organization") or card.get("card_name") or "Без названия").strip()
+            title = html.escape(title) or "Без названия"
+
+            failed_parts: list[str] = []
+            if search_failed:
+                failed_parts.append(f"поиск {search_failed}")
+            if maps_failed:
+                failed_parts.append(f"карты {maps_failed}")
+            lines.append(f"• <b>{title}</b>: {', '.join(failed_parts)} (всего {total_failed})")
+        return lines
 
     @staticmethod
     def _default_log(message: str) -> None:
