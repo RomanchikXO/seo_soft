@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from shagteampro.application.services.card_service import CardService
 from shagteampro.application.services.import_service import ImportService
 from shagteampro.application.services.key_service import KeyService
+from shagteampro.application.services.notification_service import NotificationService
 from shagteampro.application.services.search_runner_service import SearchRunnerService
 from shagteampro.application.services.settings_service import SettingsService
 from shagteampro.infrastructure.importers.excel_importer import ExcelImporter
@@ -26,6 +27,7 @@ class AppServices:
     import_service: ImportService
     settings_service: SettingsService
     search_runner_service: SearchRunnerService
+    notification_service: NotificationService | None = None
 
 
 class CardSettingsRequest(BaseModel):
@@ -83,6 +85,9 @@ class SettingsRequest(BaseModel):
     coordinates: str = ""
     captcha_service: str = "manual"
     capsola_token: str = ""
+    telegram_token: str = ""
+    telegram_chat_id: str = ""
+    telegram_proxy: str = ""
 
 
 class OptimizationRunRequest(BaseModel):
@@ -124,6 +129,7 @@ def build_services(database_path: Path | None = None) -> AppServices:
         import_service=ImportService(excel_importer=ExcelImporter()),
         settings_service=settings_service,
         search_runner_service=SearchRunnerService(settings_service=settings_service),
+        notification_service=NotificationService(settings_service=settings_service),
     )
 
 
@@ -327,7 +333,17 @@ def create_app(base_dir: Path | None = None, services: AppServices | None = None
                 }
             )
 
-        return resolved_services.search_runner_service.run_cards_optimization(cards_payload, payload.threads)
+        summary = resolved_services.search_runner_service.run_cards_optimization(
+            cards_payload, payload.threads
+        )
+
+        if resolved_services.notification_service is not None:
+            try:
+                resolved_services.notification_service.notify_optimization_finished(summary)
+            except Exception:
+                pass
+
+        return summary
 
     @app.post("/api/shutdown")
     def shutdown(request: Request) -> dict[str, bool]:

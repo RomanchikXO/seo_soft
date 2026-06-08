@@ -6,9 +6,49 @@ import pytest
 
 from shagteampro.application.services.card_service import CardService
 from shagteampro.application.services.key_service import KeyService
+from shagteampro.application.services.notification_service import NotificationService
 from shagteampro.application.services.search_runner_service import SearchRunnerService
 from shagteampro.application.services.settings_service import SettingsService
 from shagteampro.infrastructure.storage.sqlite_repo import SqliteRepository
+
+
+class _FakeNotifier:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, str, str, str]] = []
+
+    def send_message(self, token: str, chat_id: str, text: str, proxy: str = "") -> bool:
+        self.sent.append((token, chat_id, text, proxy))
+        return True
+
+
+def _optimization_summary() -> dict[str, object]:
+    return {
+        "processed_cards": 2,
+        "total_search_target": 5,
+        "total_search_performed": 4,
+        "total_maps_target": 3,
+        "total_maps_performed": 1,
+        "cards": [
+            {
+                "card_id": 1,
+                "card_name": "Card A",
+                "organization": "Кофейня",
+                "search_target": 3,
+                "search_performed": 3,
+                "maps_target": 1,
+                "maps_performed": 0,
+            },
+            {
+                "card_id": 2,
+                "card_name": "Card B",
+                "organization": "",
+                "search_target": 2,
+                "search_performed": 1,
+                "maps_target": 2,
+                "maps_performed": 1,
+            },
+        ],
+    }
 
 
 def test_card_service_validation_and_duplicate(tmp_path: Path) -> None:
@@ -61,6 +101,87 @@ def test_settings_service_normalizes_values(tmp_path: Path) -> None:
         "allow_target_events": "1",
         "click_website": "4",
     }
+
+
+def test_notification_message_contains_statistics() -> None:
+    text = NotificationService.build_optimization_message(_optimization_summary())
+    assert "Оптимизация завершена" in text
+    assert "Обработано карточек: <b>2</b>" in text
+    assert "Переходы в поиске: <b>4/5</b>" in text
+    assert "Переходы в карты: <b>1/3</b>" in text
+    assert "Не выполнено действий: <b>3</b>" in text
+    assert "Кофейня" in text
+    assert "Card B" in text
+
+
+def test_notification_skipped_without_telegram_settings(tmp_path: Path) -> None:
+    repo = SqliteRepository(tmp_path / "svc.db")
+    settings = SettingsService(repo)
+    notifier = _FakeNotifier()
+    service = NotificationService(settings_service=settings, notifier=notifier)
+
+    sent = service.notify_optimization_finished(_optimization_summary(), background=False)
+    assert sent is False
+    assert notifier.sent == []
+
+
+def test_notification_sends_when_telegram_configured(tmp_path: Path) -> None:
+    repo = SqliteRepository(tmp_path / "svc.db")
+    settings = SettingsService(repo)
+    settings.save_settings({"telegram_token": "  token-123  ", "telegram_chat_id": "  999  "})
+    notifier = _FakeNotifier()
+    service = NotificationService(settings_service=settings, notifier=notifier)
+
+    sent = service.notify_optimization_finished(_optimization_summary(), background=False)
+    assert sent is True
+    assert len(notifier.sent) == 1
+    token, chat_id, text, proxy = notifier.sent[0]
+    assert token == "token-123"
+    assert chat_id == "999"
+    assert proxy == ""
+    assert "Оптимизация завершена" in text
+
+
+def test_notification_passes_valid_proxy(tmp_path: Path) -> None:
+    repo = SqliteRepository(tmp_path / "svc.db")
+    settings = SettingsService(repo)
+    settings.save_settings(
+        {
+            "telegram_token": "token-123",
+            "telegram_chat_id": "999",
+            "telegram_proxy": "http://user:pass@123.45.67.89:8080",
+        }
+    )
+    notifier = _FakeNotifier()
+    service = NotificationService(settings_service=settings, notifier=notifier)
+
+    service.notify_optimization_finished(_optimization_summary(), background=False)
+    assert notifier.sent[0][3] == "http://user:pass@123.45.67.89:8080"
+
+
+def test_notification_drops_invalid_proxy(tmp_path: Path) -> None:
+    repo = SqliteRepository(tmp_path / "svc.db")
+    settings = SettingsService(repo)
+    settings.save_settings(
+        {
+            "telegram_token": "token-123",
+            "telegram_chat_id": "999",
+            "telegram_proxy": "не-прокси-чушь",
+        }
+    )
+    notifier = _FakeNotifier()
+    service = NotificationService(settings_service=settings, notifier=notifier)
+
+    service.notify_optimization_finished(_optimization_summary(), background=False)
+    assert notifier.sent[0][3] == ""
+
+
+def test_notification_proxy_validation() -> None:
+    assert NotificationService.is_valid_proxy("http://123.45.67.89:8080") is True
+    assert NotificationService.is_valid_proxy("https://user:pass@proxy.example.com:3128") is True
+    assert NotificationService.is_valid_proxy("123.45.67.89:8080") is False
+    assert NotificationService.is_valid_proxy("http://proxy-without-port") is False
+    assert NotificationService.is_valid_proxy("ftp://host:21") is False
 
 
 def test_search_runner_build_query() -> None:

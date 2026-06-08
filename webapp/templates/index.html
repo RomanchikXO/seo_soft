@@ -150,6 +150,18 @@
           <div id="capsolaSettingsArea" class="hidden" style="margin-top: 16px; padding-left: 24px;">
             <label>API-токен Capsola<input id="capsolaTokenInput" type="text" placeholder="Введите ключ" /></label>
           </div>
+
+          <h4 style="margin-top: 24px;">Уведомления в Telegram</h4>
+          <label>Токен бота<input id="telegramTokenInput" type="text" placeholder="123456:ABC-DEF..." /></label>
+          <label>ID пользователя / чата<input id="telegramChatIdInput" type="text" placeholder="123456789" /></label>
+          <label>
+            Прокси (необязательно)
+            <input id="telegramProxyInput" type="text" placeholder="http://user:pass@123.45.67.89:8080" />
+          </label>
+          <small style="color: #9aa0a6; display: block; margin-top: -4px;">
+            Формат: http://логин:пароль@хост:порт (логин и пароль необязательны).
+            Пример: http://123.45.67.89:8080
+          </small>
         </div>
       </div>
       <div class="modal-actions">

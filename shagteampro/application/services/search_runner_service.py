@@ -151,6 +151,7 @@ class SearchRunnerService:
         return {
             "card_id": int(card_payload.get("card_id", 0)),
             "card_name": str(card_payload.get("card_name", "")),
+            "organization": str(card_payload.get("organization", "")),
             "search_target": self._to_non_negative_int(card_payload.get("search_target", 0)),
             "search_performed": 0,
             "search_effect_keys": [],

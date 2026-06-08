@@ -78,6 +78,8 @@ const NUMERIC_FIELD_CONFIG = [
   },
 ];
 
+const TELEGRAM_PROXY_PATTERN = /^https?:\/\/(?:[^\s:@/]+(?::[^\s:@/]*)?@)?[^\s:@/]+:\d{1,5}\/?$/;
+
 const state = {
   cards: [],
   selectedCardId: null,
@@ -129,6 +131,9 @@ const ui = {
   captchaServiceCapsola: document.getElementById("captchaServiceCapsola"),
   capsolaSettingsArea: document.getElementById("capsolaSettingsArea"),
   capsolaTokenInput: document.getElementById("capsolaTokenInput"),
+  telegramTokenInput: document.getElementById("telegramTokenInput"),
+  telegramChatIdInput: document.getElementById("telegramChatIdInput"),
+  telegramProxyInput: document.getElementById("telegramProxyInput"),
   closeGlobalSettingsBtn: document.getElementById("closeGlobalSettingsBtn"),
   saveGlobalSettingsBtn: document.getElementById("saveGlobalSettingsBtn"),
   settingsModal: document.getElementById("settingsModal"),
@@ -709,6 +714,9 @@ async function openGlobalSettingsModal() {
       ui.capsolaSettingsArea.classList.add("hidden");
     }
     ui.capsolaTokenInput.value = settings.capsola_token || "";
+    ui.telegramTokenInput.value = settings.telegram_token || "";
+    ui.telegramChatIdInput.value = settings.telegram_chat_id || "";
+    ui.telegramProxyInput.value = settings.telegram_proxy || "";
   } catch (error) {
     alert(`Не удалось загрузить глобальные настройки: ${error.message}`);
   }
@@ -717,12 +725,22 @@ async function openGlobalSettingsModal() {
 async function saveGlobalSettings() {
   const service = ui.captchaServiceCapsola.checked ? "capsola" : "manual";
   const token = ui.capsolaTokenInput.value.trim();
+  const telegramProxy = ui.telegramProxyInput.value.trim();
+  if (telegramProxy && !TELEGRAM_PROXY_PATTERN.test(telegramProxy)) {
+    alert(
+      "Неверный формат прокси.\nИспользуйте: http://логин:пароль@хост:порт\nНапример: http://123.45.67.89:8080"
+    );
+    return;
+  }
   try {
     await api("/api/settings", {
       method: "POST",
       body: JSON.stringify({
         captcha_service: service,
         capsola_token: token,
+        telegram_token: ui.telegramTokenInput.value.trim(),
+        telegram_chat_id: ui.telegramChatIdInput.value.trim(),
+        telegram_proxy: telegramProxy,
       }),
     });
     ui.globalSettingsModal.classList.add("hidden");
