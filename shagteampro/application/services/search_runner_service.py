@@ -830,7 +830,7 @@ class SearchRunnerService:
         """Запускает локальный Chrome или встроенный Chromium в видимом режиме."""
         launch_options = {
             "headless": False,
-            "args": ["--start-maximized"],
+            "args": ["--start-maximized", "--incognito"],
         }
 
         chrome_path = self._local_chrome_executable_path()
