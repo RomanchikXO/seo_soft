@@ -20,7 +20,6 @@
   <header class="topbar">
     <div class="title">ShagTeamPro</div>
     <div class="topbar-actions">
-      <button id="openScheduleBtn" class="icon-btn" title="Отложенный запуск">🕓</button>
       <button id="openGlobalSettingsBtn" class="icon-btn" title="Глобальные настройки">🤖</button>
       <button id="openSettingsBtn" class="icon-btn" title="Настройки">⚙</button>
     </div>
@@ -32,6 +31,45 @@
       <button id="optimizationSelectAllBtn" class="btn hidden">Выбрать все</button>
       <div id="cardsList" class="cards-list"></div>
       <button id="addCardBtn" class="btn primary">+ Добавить карточку</button>
+    </aside>
+
+    <aside class="schedule-panel">
+      <div class="panel-title">Режим запуска</div>
+
+      <div id="modeRealtime" class="mode-block">
+        <div class="mode-block-head">
+          <span class="mode-radio"></span>
+          <h4>Realtime</h4>
+        </div>
+        <p class="mode-desc">Моментальный запуск сразу после нажатия «Play».</p>
+      </div>
+
+      <div id="modeAuto" class="mode-block">
+        <div class="mode-block-head">
+          <span class="mode-radio"></span>
+          <h4>Автозапуск</h4>
+        </div>
+        <p class="mode-desc">Запуск по дням недели в выбранное время. После срабатывания задача планируется заново.</p>
+        <div id="autoWeekdays" class="weekday-row"></div>
+        <label class="mode-time-label">
+          Время запуска
+          <input id="autoTimeInput" type="time" />
+        </label>
+      </div>
+
+      <div id="modeDeferred" class="mode-block">
+        <div class="mode-block-head">
+          <span class="mode-radio"></span>
+          <h4>Отложенный запуск</h4>
+        </div>
+        <p class="mode-desc">Однократный запуск в выбранную дату и время.</p>
+        <label class="mode-time-label">
+          Дата и время
+          <input id="deferredDateTimeInput" type="datetime-local" />
+        </label>
+      </div>
+
+      <p class="mode-foot-hint">Нажмите «Play» на вкладке «Оптимизация», чтобы запланировать задачу по выбранному режиму.</p>
     </aside>
 
     <section class="workspace">
@@ -80,8 +118,8 @@
             />
             <button id="optimizationPlayBtn" class="btn play optimization-play-btn">▶ Play</button>
           </div>
-          <div id="optimizationScheduleInfo" class="schedule-info hidden"></div>
           <div id="optimizationStatus" class="run-status"></div>
+          <div id="optimizationTasksList" class="tasks-list"></div>
         </section>
       </div>
     </section>
@@ -177,35 +215,6 @@
       <div class="modal-actions">
         <button id="closeGlobalSettingsBtn" class="btn">Закрыть</button>
         <button id="saveGlobalSettingsBtn" class="btn primary">Сохранить</button>
-      </div>
-    </div>
-  </div>
-
-  <div id="scheduleModal" class="modal hidden">
-    <div class="modal-content schedule-modal-content">
-      <div class="schedule-head">
-        <span class="schedule-icon">🕓</span>
-        <div>
-          <h3>Отложенный запуск</h3>
-          <p class="schedule-hint">Выберите дату и время — оптимизация выбранных карточек запустится автоматически.</p>
-        </div>
-      </div>
-
-      <label class="schedule-field">
-        Дата и время запуска
-        <div class="schedule-field-row">
-          <input id="scheduleDateTimeInput" type="datetime-local" />
-          <button id="resetScheduleBtn" class="btn" type="button" title="Сбросить дату">Сбросить</button>
-        </div>
-        <small class="schedule-note">Если дата не задана — запуск выполнится моментально.</small>
-      </label>
-
-      <div id="scheduleSummary" class="schedule-summary"></div>
-
-      <div class="modal-actions">
-        <button id="cancelScheduleBtn" class="btn danger schedule-cancel-btn hidden">Отменить запуск</button>
-        <button id="closeScheduleBtn" class="btn">Закрыть</button>
-        <button id="confirmScheduleBtn" class="btn primary">Сохранить</button>
       </div>
     </div>
   </div>

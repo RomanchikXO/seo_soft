@@ -92,12 +92,24 @@ const state = {
   activeTab: "keys",
   optimizationThreads: 1,
   optimizationSelectedCardIds: new Set(),
-  savedScheduleAt: null,
-  scheduleAt: null,
-  scheduleSnapshot: null,
-  scheduleTimer: null,
-  scheduleCountdownTimer: null,
+  scheduleMode: "auto",
+  autoWeekdays: new Set(),
+  tasks: [],
+  taskSeq: 0,
+  tasksCountdownTimer: null,
 };
+
+const WEEKDAYS = [
+  { day: 1, label: "Пн" },
+  { day: 2, label: "Вт" },
+  { day: 3, label: "Ср" },
+  { day: 4, label: "Чт" },
+  { day: 5, label: "Пт" },
+  { day: 6, label: "Сб" },
+  { day: 0, label: "Вс" },
+];
+const WEEKDAY_SHORT = { 0: "Вс", 1: "Пн", 2: "Вт", 3: "Ср", 4: "Чт", 5: "Пт", 6: "Сб" };
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
 
 const ui = {
   initScreen: document.getElementById("initScreen"),
@@ -120,6 +132,14 @@ const ui = {
   optimizationSelectAllBtn: document.getElementById("optimizationSelectAllBtn"),
   optimizationPlayBtn: document.getElementById("optimizationPlayBtn"),
   optimizationStatus: document.getElementById("optimizationStatus"),
+  optimizationTasksList: document.getElementById("optimizationTasksList"),
+
+  modeRealtime: document.getElementById("modeRealtime"),
+  modeAuto: document.getElementById("modeAuto"),
+  modeDeferred: document.getElementById("modeDeferred"),
+  autoWeekdays: document.getElementById("autoWeekdays"),
+  autoTimeInput: document.getElementById("autoTimeInput"),
+  deferredDateTimeInput: document.getElementById("deferredDateTimeInput"),
 
   keysHead: document.getElementById("keysHead"),
   keysBody: document.getElementById("keysBody"),
@@ -128,16 +148,6 @@ const ui = {
   runSearchBtn: document.getElementById("runSearchBtn"),
   runStatus: document.getElementById("runStatus"),
   importFileInput: document.getElementById("importFileInput"),
-
-  openScheduleBtn: document.getElementById("openScheduleBtn"),
-  scheduleModal: document.getElementById("scheduleModal"),
-  scheduleDateTimeInput: document.getElementById("scheduleDateTimeInput"),
-  resetScheduleBtn: document.getElementById("resetScheduleBtn"),
-  scheduleSummary: document.getElementById("scheduleSummary"),
-  optimizationScheduleInfo: document.getElementById("optimizationScheduleInfo"),
-  cancelScheduleBtn: document.getElementById("cancelScheduleBtn"),
-  closeScheduleBtn: document.getElementById("closeScheduleBtn"),
-  confirmScheduleBtn: document.getElementById("confirmScheduleBtn"),
 
   openSettingsBtn: document.getElementById("openSettingsBtn"),
   openGlobalSettingsBtn: document.getElementById("openGlobalSettingsBtn"),
@@ -741,74 +751,14 @@ ui.optimizationSelectAllBtn.onclick = () => {
   renderCards();
   refreshOptimizationStatus();
 };
-async function runOptimization(cardIds, threads) {
-  const ids = cardIds ?? [...state.optimizationSelectedCardIds];
-  const threadCount = threads ?? state.optimizationThreads;
-  if (ids.length === 0) {
-    alert("Выберите хотя бы одну карточку для оптимизации.");
-    return;
-  }
-  if (threadCount <= 0) {
-    alert("Укажите количество потоков больше 0.");
-    return;
-  }
-  ui.optimizationPlayBtn.disabled = true;
-  const initialText = ui.optimizationPlayBtn.textContent;
-  ui.optimizationPlayBtn.textContent = "▶ Запуск...";
-  ui.optimizationStatus.textContent = `Выполняется оптимизация: карточек ${ids.length}, потоков ${threadCount}.`;
-  try {
-    const result = await api("/api/optimization/run", {
-      method: "POST",
-      body: JSON.stringify({
-        card_ids: ids,
-        threads: threadCount,
-      }),
-    });
-    ui.optimizationStatus.textContent =
-      `Готово. Карточек: ${result.processed_cards}, Поиск: ${result.total_search_performed}/${result.total_search_target}, Карты: ${result.total_maps_performed}/${result.total_maps_target}.`;
-    return result;
-  } catch (error) {
-    ui.optimizationStatus.textContent = "Ошибка оптимизации.";
-    alert(`Не удалось выполнить оптимизацию: ${error.message}`);
-  } finally {
-    ui.optimizationPlayBtn.disabled = false;
-    ui.optimizationPlayBtn.textContent = initialText;
-  }
+async function executeOptimization(cardIds, threads) {
+  return api("/api/optimization/run", {
+    method: "POST",
+    body: JSON.stringify({ card_ids: cardIds, threads }),
+  });
 }
 
-function armScheduledRun() {
-  const cardIds = [...state.optimizationSelectedCardIds];
-  if (cardIds.length === 0) {
-    alert("Выберите хотя бы одну карточку для оптимизации.");
-    return;
-  }
-  if (state.optimizationThreads <= 0) {
-    alert("Укажите количество потоков больше 0.");
-    return;
-  }
-  const delay = state.savedScheduleAt - Date.now();
-  clearSchedule();
-  state.scheduleAt = state.savedScheduleAt;
-  state.scheduleSnapshot = { cardIds, threads: state.optimizationThreads };
-  state.scheduleTimer = setTimeout(triggerScheduledRun, delay);
-  state.scheduleCountdownTimer = setInterval(updateScheduleInfo, 1000);
-  updateScheduleView();
-}
-
-function handlePlayClick() {
-  if (state.scheduleAt) {
-    return;
-  }
-  if (state.savedScheduleAt && state.savedScheduleAt > Date.now()) {
-    armScheduledRun();
-    return;
-  }
-  state.savedScheduleAt = null;
-  updateScheduleView();
-  runOptimization();
-}
-
-ui.optimizationPlayBtn.onclick = handlePlayClick;
+ui.optimizationPlayBtn.onclick = scheduleTaskFromPlay;
 async function openGlobalSettingsModal() {
   ui.globalSettingsModal.classList.remove("hidden");
   try {
@@ -887,141 +837,270 @@ function toLocalInputValue(date) {
 function formatCountdown(ms) {
   const total = Math.max(0, Math.floor(ms / 1000));
   const pad = (n) => String(n).padStart(2, "0");
-  const hours = Math.floor(total / 3600);
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
   const minutes = Math.floor((total % 3600) / 60);
   const seconds = total % 60;
-  return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
+  const head = days > 0 ? `${days}д ` : "";
+  return `${head}${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
 }
 
-function clearSchedule() {
-  if (state.scheduleTimer) {
-    clearTimeout(state.scheduleTimer);
-    state.scheduleTimer = null;
+function setScheduleMode(mode) {
+  state.scheduleMode = mode;
+  const blocks = {
+    realtime: ui.modeRealtime,
+    auto: ui.modeAuto,
+    deferred: ui.modeDeferred,
+  };
+  for (const [blockMode, element] of Object.entries(blocks)) {
+    element.classList.toggle("active", mode === blockMode);
+    element.classList.toggle("dimmed", mode !== blockMode);
   }
-  if (state.scheduleCountdownTimer) {
-    clearInterval(state.scheduleCountdownTimer);
-    state.scheduleCountdownTimer = null;
-  }
-  state.scheduleAt = null;
-  state.scheduleSnapshot = null;
 }
 
-function updateScheduleView() {
-  const count = state.optimizationSelectedCardIds.size;
-  const hasSaved = !!state.savedScheduleAt;
-  const isArmed = !!state.scheduleAt;
-
-  ui.openScheduleBtn.classList.toggle("scheduled", hasSaved || isArmed);
-
-  if (hasSaved) {
-    const when = new Date(state.savedScheduleAt).toLocaleString("ru-RU");
-    ui.scheduleSummary.textContent =
-      `Сохранено время запуска: ${when}. Запуск начнётся после нажатия «Play».`;
-    ui.cancelScheduleBtn.classList.remove("hidden");
-  } else {
-    ui.scheduleSummary.textContent =
-      `Будет запущена оптимизация выбранных карточек. Сейчас выбрано: ${count}, потоки: ${state.optimizationThreads}.`;
-    ui.cancelScheduleBtn.classList.add("hidden");
+function renderWeekdays() {
+  ui.autoWeekdays.innerHTML = "";
+  for (const { day, label } of WEEKDAYS) {
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = `weekday-chip ${state.autoWeekdays.has(day) ? "on" : ""}`;
+    chip.textContent = label;
+    chip.onclick = () => {
+      setScheduleMode("auto");
+      if (state.autoWeekdays.has(day)) {
+        state.autoWeekdays.delete(day);
+      } else {
+        state.autoWeekdays.add(day);
+      }
+      renderWeekdays();
+    };
+    ui.autoWeekdays.appendChild(chip);
   }
-
-  updateScheduleInfo();
 }
 
-function updateScheduleInfo() {
-  if (state.scheduleAt) {
-    const remaining = state.scheduleAt - Date.now();
-    const when = new Date(state.scheduleAt).toLocaleString("ru-RU");
-    ui.optimizationScheduleInfo.classList.remove("hidden");
-    ui.optimizationScheduleInfo.innerHTML =
-      `<span class="schedule-dot"></span>` +
-      `<span>Запуск запланирован на <b>${when}</b> &nbsp; ` +
-      `До запуска: <span class="schedule-countdown">${formatCountdown(remaining)}</span></span>` +
-      `<button type="button" class="btn schedule-info-cancel">Отменить</button>`;
-  } else if (state.savedScheduleAt) {
-    const when = new Date(state.savedScheduleAt).toLocaleString("ru-RU");
-    ui.optimizationScheduleInfo.classList.remove("hidden");
-    ui.optimizationScheduleInfo.innerHTML =
-      `<span class="schedule-dot"></span>` +
-      `<span>Время запуска сохранено: <b>${when}</b>. Нажмите «Play», чтобы запустить по времени.</span>` +
-      `<button type="button" class="btn schedule-info-cancel">Отменить</button>`;
-  } else {
-    ui.optimizationScheduleInfo.classList.add("hidden");
-    ui.optimizationScheduleInfo.innerHTML = "";
+function computeNextAutoRun(weekdays, timeStr, fromTs) {
+  const [hours, minutes] = timeStr.split(":").map((part) => Number(part));
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+  for (let offset = 0; offset <= 7; offset += 1) {
+    const candidate = new Date(fromTs);
+    candidate.setDate(candidate.getDate() + offset);
+    candidate.setHours(hours, minutes, 0, 0);
+    if (weekdays.includes(candidate.getDay()) && candidate.getTime() > fromTs) {
+      return candidate.getTime();
+    }
+  }
+  return null;
+}
+
+function describeTask(task) {
+  if (task.type === "realtime") {
+    return "Realtime · моментальный запуск";
+  }
+  if (task.type === "auto") {
+    const days = task.weekdays.map((day) => WEEKDAY_SHORT[day]).join(", ");
+    return `Автозапуск · ${days} в ${task.time}`;
+  }
+  return `Отложенный запуск · ${new Date(task.nextAt).toLocaleString("ru-RU")}`;
+}
+
+function armTask(task) {
+  const delay = task.nextAt - Date.now();
+  if (delay > MAX_TIMEOUT_MS) {
+    task.timer = setTimeout(() => armTask(task), MAX_TIMEOUT_MS);
     return;
   }
-  const cancelBtn = ui.optimizationScheduleInfo.querySelector(".schedule-info-cancel");
-  if (cancelBtn) cancelBtn.onclick = cancelSchedule;
+  task.timer = setTimeout(() => runTask(task), Math.max(0, delay));
 }
 
-async function triggerScheduledRun() {
-  const snapshot = state.scheduleSnapshot;
-  state.savedScheduleAt = null;
-  clearSchedule();
-  updateScheduleView();
-  if (!snapshot) return;
-  switchTab("optimization");
-  await runOptimization(snapshot.cardIds, snapshot.threads);
-}
-
-function openScheduleModal() {
-  if (state.savedScheduleAt) {
-    ui.scheduleDateTimeInput.value = toLocalInputValue(new Date(state.savedScheduleAt));
-  } else {
-    const defaultDate = new Date(Date.now() + 60 * 60 * 1000);
-    ui.scheduleDateTimeInput.value = toLocalInputValue(defaultDate);
+function scheduleTaskFromPlay() {
+  const cardIds = [...state.optimizationSelectedCardIds];
+  if (cardIds.length === 0) {
+    alert("Выберите хотя бы одну карточку для оптимизации.");
+    return;
   }
-  updateScheduleView();
-  ui.scheduleModal.classList.remove("hidden");
-}
-
-function confirmSchedule() {
-  const value = ui.scheduleDateTimeInput.value;
-  if (!value) {
-    state.savedScheduleAt = null;
-    clearSchedule();
-    updateScheduleView();
-    ui.scheduleModal.classList.add("hidden");
+  const threads = state.optimizationThreads;
+  if (threads <= 0) {
+    alert("Укажите количество потоков больше 0.");
     return;
   }
 
-  const target = new Date(value);
-  const timestamp = target.getTime();
-  if (!Number.isFinite(timestamp) || timestamp <= Date.now()) {
-    alert("Дата и время запуска должны быть в будущем.");
-    return;
+  const task = {
+    id: ++state.taskSeq,
+    type: state.scheduleMode,
+    cardIds,
+    threads,
+    status: "scheduled",
+    resultText: "",
+    timer: null,
+    weekdays: [],
+    time: "",
+    nextAt: null,
+  };
+
+  if (state.scheduleMode === "realtime") {
+    task.nextAt = Date.now();
+  } else if (state.scheduleMode === "auto") {
+    const weekdays = [...state.autoWeekdays].sort((a, b) => a - b);
+    if (weekdays.length === 0) {
+      alert("Выберите хотя бы один день недели для автозапуска.");
+      return;
+    }
+    const time = (ui.autoTimeInput.value || "").trim();
+    if (!time) {
+      alert("Укажите время автозапуска.");
+      return;
+    }
+    const nextAt = computeNextAutoRun(weekdays, time, Date.now());
+    if (!nextAt) {
+      alert("Не удалось вычислить время запуска. Проверьте дни недели и время.");
+      return;
+    }
+    task.weekdays = weekdays;
+    task.time = time;
+    task.nextAt = nextAt;
+  } else {
+    const value = ui.deferredDateTimeInput.value;
+    if (!value) {
+      alert("Укажите дату и время отложенного запуска.");
+      return;
+    }
+    const timestamp = new Date(value).getTime();
+    if (!Number.isFinite(timestamp) || timestamp <= Date.now()) {
+      alert("Дата и время запуска должны быть в будущем.");
+      return;
+    }
+    task.nextAt = timestamp;
   }
 
-  clearSchedule();
-  state.savedScheduleAt = timestamp;
-  updateScheduleView();
-  ui.scheduleModal.classList.add("hidden");
+  state.tasks.push(task);
+  armTask(task);
+  renderTasks();
+  ensureCountdownTimer();
 }
 
-function resetSchedule() {
-  ui.scheduleDateTimeInput.value = "";
-  state.savedScheduleAt = null;
-  clearSchedule();
-  updateScheduleView();
-  ui.scheduleDateTimeInput.focus();
-}
-
-function cancelSchedule() {
-  state.savedScheduleAt = null;
-  clearSchedule();
-  updateScheduleView();
-}
-
-ui.openScheduleBtn.onclick = openScheduleModal;
-ui.confirmScheduleBtn.onclick = confirmSchedule;
-ui.resetScheduleBtn.onclick = resetSchedule;
-ui.scheduleDateTimeInput.oninput = updateScheduleView;
-ui.cancelScheduleBtn.onclick = cancelSchedule;
-ui.closeScheduleBtn.onclick = () => ui.scheduleModal.classList.add("hidden");
-ui.scheduleModal.onclick = (event) => {
-  if (event.target === ui.scheduleModal) {
-    ui.scheduleModal.classList.add("hidden");
+async function runTask(task) {
+  task.timer = null;
+  task.status = "running";
+  renderTasks();
+  try {
+    const result = await executeOptimization(task.cardIds, task.threads);
+    const finishedAt = new Date().toLocaleTimeString("ru-RU");
+    task.status = "done";
+    task.resultText =
+      `Готово в ${finishedAt}. Карточек: ${result.processed_cards}, ` +
+      `Поиск: ${result.total_search_performed}/${result.total_search_target}, ` +
+      `Карты: ${result.total_maps_performed}/${result.total_maps_target}.`;
+  } catch (error) {
+    task.status = "error";
+    task.resultText = `Ошибка запуска: ${error.message}`;
   }
-};
+
+  if (task.type === "auto") {
+    const nextAt = computeNextAutoRun(task.weekdays, task.time, Date.now());
+    if (nextAt) {
+      task.nextAt = nextAt;
+      task.status = "scheduled";
+      armTask(task);
+    }
+  }
+
+  renderTasks();
+  ensureCountdownTimer();
+}
+
+function cancelTask(taskId) {
+  const index = state.tasks.findIndex((item) => item.id === taskId);
+  if (index === -1) return;
+  const [task] = state.tasks.splice(index, 1);
+  if (task.timer) clearTimeout(task.timer);
+  renderTasks();
+  ensureCountdownTimer();
+}
+
+function ensureCountdownTimer() {
+  const hasPending = state.tasks.some((task) => task.status === "scheduled" && task.nextAt);
+  if (hasPending && !state.tasksCountdownTimer) {
+    state.tasksCountdownTimer = setInterval(tickCountdowns, 1000);
+  } else if (!hasPending && state.tasksCountdownTimer) {
+    clearInterval(state.tasksCountdownTimer);
+    state.tasksCountdownTimer = null;
+  }
+}
+
+function tickCountdowns() {
+  for (const task of state.tasks) {
+    if (task.status !== "scheduled" || !task.nextAt) continue;
+    const span = ui.optimizationTasksList.querySelector(`.task-countdown[data-task="${task.id}"]`);
+    if (span) span.textContent = formatCountdown(task.nextAt - Date.now());
+  }
+}
+
+function renderTasks() {
+  ui.optimizationTasksList.innerHTML = "";
+  for (const task of state.tasks) {
+    const card = document.createElement("div");
+    card.className = `task-card ${task.status}`;
+
+    const row = document.createElement("div");
+    row.className = "task-row";
+
+    const title = document.createElement("div");
+    title.className = "task-title";
+    const dot = document.createElement("span");
+    dot.className = "task-dot";
+    title.appendChild(dot);
+    title.appendChild(document.createTextNode(describeTask(task)));
+    row.appendChild(title);
+
+    const cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.className = "btn task-cancel";
+    cancelBtn.textContent = task.status === "done" || task.status === "error" ? "Убрать" : "Отменить";
+    cancelBtn.onclick = () => cancelTask(task.id);
+    row.appendChild(cancelBtn);
+    card.appendChild(row);
+
+    const meta = document.createElement("div");
+    meta.className = "task-meta";
+    if (task.status === "scheduled" && task.nextAt) {
+      const when = new Date(task.nextAt).toLocaleString("ru-RU");
+      meta.innerHTML =
+        `Карточек: ${task.cardIds.length}, потоки: ${task.threads}. ` +
+        `Следующий запуск: <b>${when}</b> · ` +
+        `через <span class="task-countdown" data-task="${task.id}">${formatCountdown(task.nextAt - Date.now())}</span>`;
+    } else if (task.status === "running") {
+      meta.textContent = `Выполняется… Карточек: ${task.cardIds.length}, потоки: ${task.threads}.`;
+    } else {
+      meta.textContent = `Карточек: ${task.cardIds.length}, потоки: ${task.threads}.`;
+    }
+    card.appendChild(meta);
+
+    if (task.resultText) {
+      const result = document.createElement("div");
+      result.className = "task-result";
+      result.textContent = task.resultText;
+      card.appendChild(result);
+    }
+
+    ui.optimizationTasksList.appendChild(card);
+  }
+}
+
+ui.modeRealtime.addEventListener("mousedown", () => setScheduleMode("realtime"));
+ui.modeRealtime.addEventListener("focusin", () => setScheduleMode("realtime"));
+ui.modeAuto.addEventListener("mousedown", () => setScheduleMode("auto"));
+ui.modeAuto.addEventListener("focusin", () => setScheduleMode("auto"));
+ui.modeDeferred.addEventListener("mousedown", () => setScheduleMode("deferred"));
+ui.modeDeferred.addEventListener("focusin", () => setScheduleMode("deferred"));
+
+function initScheduleModePanel() {
+  renderWeekdays();
+  const soon = new Date(Date.now() + 60 * 60 * 1000);
+  ui.deferredDateTimeInput.value = toLocalInputValue(soon);
+  const pad = (n) => String(n).padStart(2, "0");
+  ui.autoTimeInput.value = `${pad(soon.getHours())}:${pad(soon.getMinutes())}`;
+  setScheduleMode("auto");
+}
 
 ui.openSettingsBtn.onclick = async () => {
   try {
@@ -1042,4 +1121,5 @@ ui.autofillYandexOrgBtn.onclick = autofillByYandexOrgUrl;
 window.addEventListener("pagehide", requestShutdownOnClose);
 
 syncOptimizationThreadsUi();
+initScheduleModePanel();
 startup();

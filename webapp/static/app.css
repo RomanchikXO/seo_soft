@@ -31,7 +31,7 @@ body {
 }
 .layout {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 280px 300px 1fr;
   height: calc(100vh - 56px);
 }
 .cards-panel {
@@ -367,129 +367,210 @@ input[type="number"] {
   }
 }
 
-.icon-btn.scheduled {
-  border-color: #2fbf68;
-  color: #d8ffe9;
-  box-shadow: 0 0 0 2px rgba(47, 191, 104, 0.25), 0 0 12px rgba(47, 191, 104, 0.35);
-  animation: schedulePulse 1.8s ease-in-out infinite;
-}
 @keyframes schedulePulse {
   0%, 100% { box-shadow: 0 0 0 2px rgba(47, 191, 104, 0.22), 0 0 8px rgba(47, 191, 104, 0.28); }
   50% { box-shadow: 0 0 0 2px rgba(47, 191, 104, 0.4), 0 0 16px rgba(47, 191, 104, 0.5); }
 }
 
-.schedule-modal-content {
-  width: min(440px, 96vw);
-  gap: 14px;
-}
-.schedule-head {
-  display: flex;
-  align-items: flex-start;
-  gap: 14px;
-}
-.schedule-icon {
-  font-size: 26px;
-  line-height: 1;
-  width: 48px;
-  height: 48px;
-  flex: 0 0 48px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 12px;
-  background: linear-gradient(180deg, #1c1c1c, #121212);
-  border: 1px solid #3a3a3a;
-  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.06);
-}
-.schedule-head h3 { margin: 0 0 4px; }
-.schedule-hint {
-  margin: 0;
-  color: #9aa0a6;
-  font-size: 13px;
-  line-height: 1.45;
-}
-.schedule-field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  color: #c6c6c6;
-  font-weight: 600;
-}
-.schedule-field-row {
-  display: flex;
-  gap: 8px;
-  align-items: stretch;
-}
-.schedule-field-row input[type="datetime-local"] {
-  flex: 1;
-  min-width: 0;
-}
-.schedule-field-row .btn {
-  flex: 0 0 auto;
-  font-weight: 600;
-}
-.schedule-note {
-  color: #9aa0a6;
-  font-size: 12px;
-  font-weight: 400;
-}
-input[type="datetime-local"] {
+input[type="datetime-local"],
+input[type="time"] {
   background: #151515;
   border: 1px solid #333;
   color: #f1f1f1;
   border-radius: 8px;
-  padding: 10px;
-  font-size: 15px;
+  padding: 8px;
+  font-size: 14px;
   color-scheme: dark;
 }
-input[type="datetime-local"]:focus {
+input[type="datetime-local"]:focus,
+input[type="time"]:focus {
   outline: none;
   border-color: #2fbf68;
   box-shadow: 0 0 0 2px rgba(47, 191, 104, 0.18);
 }
-.schedule-summary {
-  border: 1px solid #2f2f2f;
-  border-radius: 10px;
-  background: #121212;
-  padding: 10px 12px;
-  color: #cfcfcf;
-  font-size: 13px;
-  line-height: 1.5;
+
+/* Панель выбора режима запуска (средняя колонка) */
+.schedule-panel {
+  border-right: 1px solid #2a2a2a;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: auto;
 }
-.schedule-status,
-.schedule-info {
-  border: 1px solid rgba(47, 191, 104, 0.4);
-  border-radius: 10px;
-  background: linear-gradient(180deg, rgba(47, 191, 104, 0.12), rgba(47, 191, 104, 0.04));
-  padding: 12px 14px;
-  color: #e8ffe8;
-  font-size: 13px;
-  line-height: 1.6;
+.mode-block {
+  border: 1px solid #303030;
+  border-radius: 12px;
+  background: #101010;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  cursor: pointer;
+  transition: opacity 160ms ease, border-color 160ms ease, box-shadow 160ms ease, filter 160ms ease;
+}
+.mode-block.active {
+  border-color: #2fbf68;
+  box-shadow: 0 0 0 1px rgba(47, 191, 104, 0.25), 0 0 14px rgba(47, 191, 104, 0.18);
+}
+.mode-block.dimmed {
+  opacity: 0.4;
+  filter: grayscale(0.6);
+}
+.mode-block-head {
   display: flex;
   align-items: center;
   gap: 10px;
 }
-.schedule-info { margin-top: 10px; }
-.schedule-info-cancel {
-  margin-left: auto;
-  flex: 0 0 auto;
-  padding: 6px 10px;
-  font-size: 12px;
+.mode-block-head h4 {
+  margin: 0;
+  font-size: 15px;
+  color: #f2f2f2;
 }
-.schedule-dot {
-  width: 10px;
-  height: 10px;
-  flex: 0 0 10px;
+.mode-radio {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+  border-radius: 50%;
+  border: 2px solid #5a5a5a;
+  background: #0d0d0d;
+  position: relative;
+  transition: border-color 160ms ease;
+}
+.mode-block.active .mode-radio {
+  border-color: #2fbf68;
+}
+.mode-block.active .mode-radio::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  border-radius: 50%;
+  background: #2fbf68;
+}
+.mode-desc {
+  margin: 0;
+  color: #9aa0a6;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.mode-time-label {
+  display: flex !important;
+  flex-direction: column;
+  gap: 4px;
+  color: #c6c6c6;
+  font-size: 13px;
+  font-weight: 600;
+}
+.weekday-row {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 4px;
+}
+.weekday-chip {
+  border: 1px solid #3b3b3b;
+  background: #1b1b1b;
+  color: #d4d4d4;
+  border-radius: 8px;
+  padding: 7px 2px;
+  cursor: pointer;
+  font-size: 13px;
+  text-align: center;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+}
+.weekday-chip:hover { border-color: #5a5a5a; }
+.weekday-chip.on {
+  background: linear-gradient(180deg, #2fbf68, #1f8f4a);
+  border-color: #39b66d;
+  color: #f3fff8;
+  font-weight: 700;
+}
+.mode-foot-hint {
+  margin: auto 0 0;
+  color: #7d7d7d;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* Список запланированных задач */
+.tasks-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 10px;
+}
+.task-card {
+  border: 1px solid rgba(47, 191, 104, 0.4);
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(47, 191, 104, 0.10), rgba(47, 191, 104, 0.03));
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.task-card.running {
+  border-color: rgba(214, 188, 47, 0.5);
+  background: linear-gradient(180deg, rgba(214, 188, 47, 0.12), rgba(214, 188, 47, 0.03));
+}
+.task-card.error {
+  border-color: rgba(214, 80, 80, 0.55);
+  background: linear-gradient(180deg, rgba(214, 80, 80, 0.12), rgba(214, 80, 80, 0.03));
+}
+.task-card.done {
+  border-color: #3a3a3a;
+  background: #121212;
+}
+.task-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.task-title {
+  font-weight: 700;
+  color: #f2f2f2;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.task-dot {
+  width: 9px;
+  height: 9px;
+  flex: 0 0 9px;
   border-radius: 50%;
   background: #2fbf68;
   box-shadow: 0 0 0 4px rgba(47, 191, 104, 0.2);
   animation: schedulePulse 1.6s ease-in-out infinite;
 }
-.schedule-countdown {
+.task-card.running .task-dot { background: #d6bc2f; box-shadow: 0 0 0 4px rgba(214, 188, 47, 0.2); }
+.task-card.error .task-dot { background: #d65050; box-shadow: 0 0 0 4px rgba(214, 80, 80, 0.2); animation: none; }
+.task-card.done .task-dot { background: #6f6f6f; box-shadow: none; animation: none; }
+.task-meta {
+  color: #cfcfcf;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.task-result { color: #9aa0a6; font-size: 12px; }
+.task-countdown {
   font-variant-numeric: tabular-nums;
   font-weight: 700;
+  color: #e8ffe8;
 }
-.schedule-cancel-btn { margin-right: auto; }
+.task-cancel {
+  margin-left: auto;
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+@media (max-width: 1080px) {
+  .layout {
+    grid-template-columns: 1fr;
+    height: auto;
+  }
+  .schedule-panel {
+    border-right: none;
+    border-bottom: 1px solid #2a2a2a;
+  }
+}
 
 .init-screen {
   position: fixed;
