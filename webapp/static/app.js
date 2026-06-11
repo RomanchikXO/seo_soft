@@ -1112,7 +1112,7 @@ ui.openSettingsBtn.onclick = async () => {
 ui.closeSettingsBtn.onclick = () => ui.settingsModal.classList.add("hidden");
 ui.deleteCardBtn.onclick = deleteSelectedCard;
 ui.settingsModal.onclick = (event) => {
-  if (event.target === ui.settingsModal) {
+  if (event.target === ui.settingsModal && state.settingsMode !== "create") {
     ui.settingsModal.classList.add("hidden");
   }
 };
