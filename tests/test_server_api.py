@@ -80,6 +80,10 @@ def test_api_health_and_cards_flow(tmp_path: Path) -> None:
         key = client.post(f"/api/cards/{card_id}/keys", json={"phrase": "query one"}).json()
         key_id = key["id"]
         payload = client.get(f"/api/cards/{card_id}/keys").json()
+        assert payload["keys"][0]["search_enabled"] is True
+
+        client.patch(f"/api/keys/{key_id}/targets", json={"search_enabled": False})
+        payload = client.get(f"/api/cards/{card_id}/keys").json()
         assert payload["keys"][0]["search_enabled"] is False
 
         client.patch(f"/api/keys/{key_id}/targets", json={"search_enabled": True})

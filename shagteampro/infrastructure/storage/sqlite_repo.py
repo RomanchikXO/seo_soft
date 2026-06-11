@@ -169,8 +169,8 @@ class SqliteRepository:
         with self._connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO key_phrases(card_id, phrase, created_at)
-                VALUES (?, ?, ?)
+                INSERT INTO key_phrases(card_id, phrase, created_at, search_enabled, maps_enabled)
+                VALUES (?, ?, ?, 1, 1)
                 """,
                 (card_id, phrase, created_at),
             )
@@ -180,8 +180,8 @@ class SqliteRepository:
             card_id=card_id,
             phrase=phrase,
             created_at=datetime.fromisoformat(created_at),
-            search_enabled=False,
-            maps_enabled=False,
+            search_enabled=True,
+            maps_enabled=True,
         )
 
     def update_key_phrase(self, key_id: int, phrase: str) -> None:
@@ -204,7 +204,7 @@ class SqliteRepository:
             connection.executemany(
                 """
                 INSERT INTO key_phrases(card_id, phrase, created_at, search_enabled, maps_enabled)
-                VALUES (?, ?, ?, 0, 0)
+                VALUES (?, ?, ?, 1, 1)
                 """,
                 rows_to_insert,
             )

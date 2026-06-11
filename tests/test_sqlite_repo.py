@@ -15,13 +15,13 @@ def test_repo_card_key_crud_and_flags(tmp_path: Path) -> None:
     keys = repo.list_key_phrases(card.id)
     assert len(keys) == 1
     assert keys[0].phrase == "buy laptop"
-    assert keys[0].search_enabled is False
-    assert keys[0].maps_enabled is False
-
-    repo.update_key_phrase_targets(key.id, search_enabled=True, maps_enabled=True)
-    keys = repo.list_key_phrases(card.id)
     assert keys[0].search_enabled is True
     assert keys[0].maps_enabled is True
+
+    repo.update_key_phrase_targets(key.id, search_enabled=False, maps_enabled=False)
+    keys = repo.list_key_phrases(card.id)
+    assert keys[0].search_enabled is False
+    assert keys[0].maps_enabled is False
 
     repo.update_key_phrase(key.id, "best laptop")
     assert repo.list_key_phrases(card.id)[0].phrase == "best laptop"
