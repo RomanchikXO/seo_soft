@@ -288,7 +288,7 @@ def create_app(base_dir: Path | None = None, services: AppServices | None = None
                 content = await file.read()
                 tmp.write(content)
                 temp_path = Path(tmp.name)
-            phrases = resolved_services.import_service.import_keywords_from_excel(temp_path)
+            phrases = resolved_services.import_service.import_keywords(temp_path)
             inserted_count = resolved_services.key_service.add_phrases_bulk(card_id, phrases)
             return {"inserted": inserted_count}
         except Exception as error:

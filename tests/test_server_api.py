@@ -135,7 +135,7 @@ def test_api_import_and_delete_key(tmp_path: Path, monkeypatch) -> None:
     base_dir = Path(__file__).resolve().parents[1] / "webapp"
     app = create_app(base_dir=base_dir, services=services)
 
-    monkeypatch.setattr(services.import_service, "import_keywords_from_excel", lambda _path: ["k1", "k2"])
+    monkeypatch.setattr(services.import_service, "import_keywords", lambda _path: ["k1", "k2"])
 
     with TestClient(app) as client:
         card_id = client.post("/api/cards", json={"name": "Card 2"}).json()["id"]
