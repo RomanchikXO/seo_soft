@@ -7,12 +7,62 @@ import random
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Iterable
 
 from shagteampro.application.captcha import CaptchaService
 from shagteampro.application.services.settings_service import SettingsService
+
+
+class _ActionBudget:
+    """Потокобезопасный счетчик оставшихся целевых действий на одну карточку.
+
+    Значения `click_*` из настроек карточки трактуются как СУММАРНЫЙ лимит
+    целевого действия на все переходы карты. Каждый параллельный переход
+    резервирует часть оставшегося лимита, выполняет клики и возвращает в бюджет
+    неиспользованный остаток. За счет общего на карточку бюджета суммарное число
+    выполненных действий по каждому типу не может превысить заданный лимит.
+    """
+
+    # Порядок целевых действий в плане одного перехода карты.
+    ACTION_ORDER: tuple[str, ...] = (
+        "Показать телефон",
+        "Сайт",
+        "Маршрут",
+        "мессенджер",
+        "Записаться",
+    )
+
+    def __init__(self, limits: dict[str, int]) -> None:
+        self._remaining: dict[str, int] = {
+            label: int(value) for label, value in limits.items() if int(value) > 0
+        }
+        self._lock = threading.Lock()
+
+    def reserve(self, label: str) -> int:
+        """Резервирует случайную часть оставшегося лимита действия (0..remaining)."""
+        with self._lock:
+            remaining = self._remaining.get(label, 0)
+            if remaining <= 0:
+                return 0
+            take = random.randint(0, remaining)
+            self._remaining[label] = remaining - take
+            return take
+
+    def settle(self, label: str, reserved: int, performed: int) -> None:
+        """Возвращает в бюджет зарезервированные, но не выполненные действия."""
+        refund = int(reserved) - int(performed)
+        if refund <= 0:
+            return
+        with self._lock:
+            self._remaining[label] = self._remaining.get(label, 0) + refund
+
+    def snapshot(self) -> dict[str, int]:
+        """Возвращает копию оставшихся лимитов (для отладки/тестов)."""
+        with self._lock:
+            return dict(self._remaining)
 
 
 class SearchRunnerService:
@@ -206,9 +256,22 @@ class SearchRunnerService:
                         "in_flight": 0,
                         "effect_key_ids": set(),
                         "action_counts": {},
+                        # Бюджет целевых действий общий на все переходы карты этой карточки.
+                        "action_budget": self._build_action_budget(card_payload) if mode == "maps" else None,
                     }
                 )
         return targets
+
+    def _build_action_budget(self, card_payload: dict[str, object]) -> _ActionBudget:
+        """Создает суммарный бюджет целевых действий карты на одну карточку."""
+        limits = {
+            "Показать телефон": self._to_non_negative_int(card_payload.get("click_show_phone", 0)),
+            "Сайт": self._to_non_negative_int(card_payload.get("click_website", 0)),
+            "Маршрут": self._to_non_negative_int(card_payload.get("click_route", 0)),
+            "мессенджер": self._to_non_negative_int(card_payload.get("click_messengers", 0)),
+            "Записаться": self._to_non_negative_int(card_payload.get("click_book_story", 0)),
+        }
+        return _ActionBudget(limits)
 
     def _run_targets_in_pool(self, targets: list[dict[str, object]], max_workers: int) -> None:
         """Выполняет все цели в одном общем пуле, держа до max_workers действий одновременно.
@@ -311,7 +374,11 @@ class SearchRunnerService:
                 self._simulate_search_action(key_payload, state["card_payload"])
             )
         return self._normalize_action_result(
-            self._simulate_browser_action_one_second(key_payload, state["card_payload"])
+            self._simulate_browser_action_one_second(
+                key_payload,
+                state["card_payload"],
+                action_budget=state.get("action_budget"),
+            )
         )
 
     @staticmethod
@@ -805,6 +872,7 @@ class SearchRunnerService:
         self,
         key_payload: dict[str, object],
         card_payload: dict[str, object],
+        action_budget: _ActionBudget | None = None,
     ) -> dict[str, object]:
         """Открывает Яндекс.Карты и выполняет там запрос (только по фразе/ключу)."""
         phrase = str(key_payload.get("phrase", ""))
@@ -831,11 +899,10 @@ class SearchRunnerService:
         max_sleep_target_tab_sec = self._to_non_negative_int(card_payload.get("max_sleep_target_tab_sec", 0))
         if max_sleep_target_tab_sec < min_sleep_target_tab_sec:
             max_sleep_target_tab_sec = min_sleep_target_tab_sec
-        click_show_phone = self._to_non_negative_int(card_payload.get("click_show_phone", 0))
-        click_website = self._to_non_negative_int(card_payload.get("click_website", 0))
-        click_route = self._to_non_negative_int(card_payload.get("click_route", 0))
-        click_messengers = self._to_non_negative_int(card_payload.get("click_messengers", 0))
-        click_book_story = self._to_non_negative_int(card_payload.get("click_book_story", 0))
+        # Если бюджет не передан (например, прямой вызов), считаем лимиты только
+        # для этого перехода из настроек карточки.
+        if action_budget is None:
+            action_budget = self._build_action_budget(card_payload)
         self._log(f"simulate_maps_action: старт для запроса '{query}'.")
         maps_url = self._build_maps_url(card_payload)
         browsers_path = self._prepare_runtime_browsers_path()
@@ -872,11 +939,7 @@ class SearchRunnerService:
                 else:
                     action_counts = self._run_maps_card_activity(
                         page,
-                        click_show_phone=click_show_phone,
-                        click_website=click_website,
-                        click_route=click_route,
-                        click_messengers=click_messengers,
-                        click_book_story=click_book_story,
+                        action_budget=action_budget,
                         min_sleep_target_tab_sec=min_sleep_target_tab_sec,
                         max_sleep_target_tab_sec=max_sleep_target_tab_sec,
                     )
@@ -967,26 +1030,18 @@ class SearchRunnerService:
         self,
         page,
         *,
-        click_show_phone: int,
-        click_website: int,
-        click_route: int,
-        click_messengers: int,
-        click_book_story: int,
+        action_budget: _ActionBudget,
         min_sleep_target_tab_sec: int,
         max_sleep_target_tab_sec: int,
     ) -> dict[str, int]:
         """Выполняет целевые действия в карточке на картах в случайном порядке/объеме.
 
-        Возвращает словарь {действие: число успешно выполненных} для статистики.
+        Число попыток каждого действия резервируется из общего на карточку бюджета,
+        поэтому суммарное число выполненных действий по всем переходам карты не
+        превышает заданный в настройках лимит. Возвращает словарь
+        {действие: число успешно выполненных} для статистики.
         """
-        max_attempt_plan = [
-            ("Показать телефон", click_show_phone),
-            ("Сайт", click_website),
-            ("Маршрут", click_route),
-            ("мессенджер", click_messengers),
-            ("Записаться", click_book_story),
-        ]
-        click_plan = self._build_random_maps_action_plan(max_attempt_plan)
+        click_plan = self._build_budgeted_maps_action_plan(action_budget)
         action_counts: dict[str, int] = {}
         for action_label, attempts in click_plan:
             performed = self._perform_maps_action_clicks(
@@ -996,6 +1051,9 @@ class SearchRunnerService:
                 min_sleep_target_tab_sec=min_sleep_target_tab_sec,
                 max_sleep_target_tab_sec=max_sleep_target_tab_sec,
             )
+            performed = max(0, int(performed or 0))
+            # Возвращаем в бюджет зарезервированные, но не выполненные клики.
+            action_budget.settle(action_label, reserved=attempts, performed=performed)
             if performed:
                 action_counts[action_label] = action_counts.get(action_label, 0) + performed
         self._sleep_in_range_seconds(
@@ -1007,29 +1065,19 @@ class SearchRunnerService:
         return action_counts
 
     @staticmethod
-    def _build_random_maps_action_plan(max_attempt_plan: list[tuple[str, int]]) -> list[tuple[str, int]]:
-        """Строит случайный план: порядок действий и число попыток для каждого.
+    def _build_budgeted_maps_action_plan(action_budget: _ActionBudget) -> list[tuple[str, int]]:
+        """Строит план одного перехода, резервируя попытки из общего бюджета карточки.
 
-        Каждое включённое действие (max>0) получает случайное число попыток в [0..max].
-        При этом гарантируется, что план не будет пустым: если все выпали в 0,
-        одно случайное включённое действие получит хотя бы одну попытку.
+        Для каждого действия резервируется случайная часть оставшегося лимита
+        (0..remaining). Действия с нулевым резервом в план не попадают, порядок
+        перемешивается. План может быть пустым — на большинстве переходов целевые
+        действия не выполняются, что и обеспечивает соблюдение суммарного лимита.
         """
-        enabled = [
-            (action_label, max(0, int(max_attempts)))
-            for action_label, max_attempts in max_attempt_plan
-            if max(0, int(max_attempts)) > 0
-        ]
         plan: list[tuple[str, int]] = []
-        for action_label, safe_max in enabled:
-            planned_attempts = random.randint(0, safe_max)
-            if planned_attempts <= 0:
-                continue
-            plan.append((action_label, planned_attempts))
-
-        if not plan and enabled:
-            action_label, safe_max = random.choice(enabled)
-            plan.append((action_label, random.randint(1, safe_max)))
-
+        for action_label in _ActionBudget.ACTION_ORDER:
+            reserved = action_budget.reserve(action_label)
+            if reserved > 0:
+                plan.append((action_label, reserved))
         random.shuffle(plan)
         return plan
 

@@ -427,7 +427,7 @@ def test_search_runner_optimization_runs_search_and_maps_for_same_card(
         search_calls.append(int(key_payload["id"]))
         return True
 
-    def fake_maps(key_payload: dict[str, object], card_payload: dict[str, object]) -> bool:
+    def fake_maps(key_payload: dict[str, object], card_payload: dict[str, object], action_budget=None) -> bool:
         maps_calls.append(int(key_payload["id"]))
         return True
 
@@ -550,14 +550,16 @@ def test_search_runner_maps_mode_uses_card_activity_settings(
     )
 
     assert result == {"effect": True, "actions": {"Маршрут": 2}}
-    assert calls["target"] == {
-        "click_show_phone": 2,
-        "click_website": 1,
-        "click_route": 3,
-        "click_messengers": 4,
-        "click_book_story": 5,
-        "min_sleep_target_tab_sec": 6,
-        "max_sleep_target_tab_sec": 9,
+    target_kwargs = calls["target"]
+    assert target_kwargs["min_sleep_target_tab_sec"] == 6
+    assert target_kwargs["max_sleep_target_tab_sec"] == 9
+    # Лимиты целевых действий приходят как суммарный бюджет карточки.
+    assert target_kwargs["action_budget"].snapshot() == {
+        "Показать телефон": 2,
+        "Сайт": 1,
+        "Маршрут": 3,
+        "мессенджер": 4,
+        "Записаться": 5,
     }
     assert calls["competitor"] == {
         "chance_percent": 25,
@@ -885,11 +887,13 @@ def test_search_runner_phone_clicks_accept_when_phone_already_visible(
     assert state["slept"] == 1
 
 
-def test_search_runner_random_maps_action_plan_changes_order_and_counts(
+def test_search_runner_budgeted_plan_reserves_and_shuffles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    call_values = iter([1, 0, 2])  # phone=1, website=0, route=2
+    # Бюджет: телефон=2, сайт=3, маршрут=2. randint резервирует 1, 0, 2 соответственно.
+    from shagteampro.application.services.search_runner_service import _ActionBudget
 
+    call_values = iter([1, 0, 2])
     monkeypatch.setattr(
         "shagteampro.application.services.search_runner_service.random.randint",
         lambda _a, _b: next(call_values),
@@ -899,52 +903,62 @@ def test_search_runner_random_maps_action_plan_changes_order_and_counts(
         lambda items: items.reverse(),
     )
 
-    plan = SearchRunnerService._build_random_maps_action_plan(
-        [
-            ("Показать телефон", 2),
-            ("Сайт", 3),
-            ("Маршрут", 2),
-        ]
+    budget = _ActionBudget(
+        {"Показать телефон": 2, "Сайт": 3, "Маршрут": 2}
     )
+    plan = SearchRunnerService._build_budgeted_maps_action_plan(budget)
 
     assert plan == [("Маршрут", 2), ("Показать телефон", 1)]
+    # Зарезервированное вычтено из общего бюджета карточки.
+    assert budget.snapshot() == {"Показать телефон": 1, "Сайт": 3, "Маршрут": 0}
 
 
-def test_search_runner_random_plan_never_empty_when_actions_enabled(
+def test_search_runner_budgeted_plan_empty_when_nothing_reserved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Все случайные количества выпадают в 0, но план обязан содержать одно действие.
+    from shagteampro.application.services.search_runner_service import _ActionBudget
+
+    # Каждое действие резервирует 0 — план может быть пустым (это допустимо).
     monkeypatch.setattr(
         "shagteampro.application.services.search_runner_service.random.randint",
-        lambda a, _b: a,
-    )
-    monkeypatch.setattr(
-        "shagteampro.application.services.search_runner_service.random.choice",
-        lambda options: options[0],
+        lambda _a, _b: 0,
     )
     monkeypatch.setattr(
         "shagteampro.application.services.search_runner_service.random.shuffle",
         lambda items: None,
     )
 
-    plan = SearchRunnerService._build_random_maps_action_plan(
-        [
-            ("Показать телефон", 2),
-            ("Сайт", 3),
-        ]
-    )
+    budget = _ActionBudget({"Показать телефон": 2, "Сайт": 3})
+    plan = SearchRunnerService._build_budgeted_maps_action_plan(budget)
 
-    assert plan == [("Показать телефон", 1)]
-
-
-def test_search_runner_random_plan_empty_when_nothing_enabled() -> None:
-    plan = SearchRunnerService._build_random_maps_action_plan(
-        [
-            ("Показать телефон", 0),
-            ("Сайт", 0),
-        ]
-    )
     assert plan == []
+
+
+def test_search_runner_budget_total_never_exceeds_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from shagteampro.application.services.search_runner_service import _ActionBudget
+
+    # Имитируем 100 переходов карты: каждый раз резервируем и считаем "выполнено"
+    # ровно столько, сколько зарезервировано (без возвратов). Суммарно не больше лимита.
+    budget = _ActionBudget(
+        {"Показать телефон": 1, "Сайт": 1, "Маршрут": 1, "мессенджер": 1, "Записаться": 1}
+    )
+    performed_totals: dict[str, int] = {}
+    for _ in range(100):
+        for action_label, attempts in SearchRunnerService._build_budgeted_maps_action_plan(budget):
+            performed_totals[action_label] = performed_totals.get(action_label, 0) + attempts
+
+    assert all(total <= 1 for total in performed_totals.values())
+
+
+def test_search_runner_budget_refund_returns_unused(
+) -> None:
+    from shagteampro.application.services.search_runner_service import _ActionBudget
+
+    budget = _ActionBudget({"Сайт": 5})
+    budget.settle("Сайт", reserved=3, performed=1)
+    assert budget.snapshot()["Сайт"] == 7
 
 
 def test_search_runner_close_new_tab_if_opened_closes_extra_tab() -> None:
@@ -992,14 +1006,16 @@ def test_search_runner_run_maps_card_activity_forwards_sleep_range_to_actions(
     service = SearchRunnerService()
     captured: list[tuple[str, int, int, int]] = []
 
+    from shagteampro.application.services.search_runner_service import _ActionBudget
+
     monkeypatch.setattr(
         service,
-        "_build_random_maps_action_plan",
-        lambda _plan: [("Маршрут", 1), ("Показать телефон", 1), ("CTA", 1)],
+        "_build_budgeted_maps_action_plan",
+        lambda _budget: [("Маршрут", 1), ("Показать телефон", 1), ("CTA", 1)],
     )
     monkeypatch.setattr(service, "_sleep_in_range_seconds", lambda *_args, **_kwargs: None)
 
-    def fake_perform(page, action_label: str, attempts: int, **kwargs) -> None:
+    def fake_perform(page, action_label: str, attempts: int, **kwargs) -> int:
         captured.append(
             (
                 action_label,
@@ -1008,15 +1024,12 @@ def test_search_runner_run_maps_card_activity_forwards_sleep_range_to_actions(
                 int(kwargs["max_sleep_target_tab_sec"]),
             )
         )
+        return attempts
 
     monkeypatch.setattr(service, "_perform_maps_action_clicks", fake_perform)
     service._run_maps_card_activity(
         object(),
-        click_show_phone=2,
-        click_website=3,
-        click_route=4,
-        click_messengers=5,
-        click_book_story=6,
+        action_budget=_ActionBudget({"Маршрут": 4, "Показать телефон": 2}),
         min_sleep_target_tab_sec=7,
         max_sleep_target_tab_sec=9,
     )
