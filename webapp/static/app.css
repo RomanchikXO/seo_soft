@@ -286,6 +286,43 @@ tr.selected { background: #1b1b1b; }
   flex-direction: column;
   gap: 8px;
 }
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.modal-head h3 { margin: 0; }
+.defaults-actions {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid #3b3b3b;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #1b1b1b;
+}
+.defaults-actions .btn {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+.defaults-actions .btn:first-child {
+  border-right: 1px solid #3b3b3b;
+}
+.defaults-actions .btn:hover {
+  background: #262626;
+}
+.defaults-config-btn {
+  padding-left: 10px;
+  padding-right: 10px;
+  font-size: 15px;
+}
+.defaults-hint {
+  margin: 0;
+  color: #9aa0a6;
+  font-size: 12px;
+  line-height: 1.45;
+}
 .modal-content label { display: flex; flex-direction: column; gap: 4px; color: #c6c6c6; }
 .input-inline {
   display: flex;

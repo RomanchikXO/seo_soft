@@ -58,6 +58,26 @@ class CardSettingsRequest(BaseModel):
     map_zoom_clicks: float = Field(default=0, ge=0)
 
 
+CARD_DEFAULTS_PREFIX = "card_default__"
+
+
+class CardDefaultsRequest(BaseModel):
+    competitor_open_chance_percent: float = Field(default=0, ge=0)
+    max_open_competitor_cards: float = Field(default=0, ge=0)
+    min_sleep_competitor_card_sec: float = Field(default=0, ge=0)
+    max_sleep_competitor_card_sec: float = Field(default=0, ge=0)
+    min_sleep_target_overview_sec: float = Field(default=0, ge=0)
+    max_sleep_target_overview_sec: float = Field(default=0, ge=0)
+    min_sleep_target_tab_sec: float = Field(default=0, ge=0)
+    max_sleep_target_tab_sec: float = Field(default=0, ge=0)
+    click_show_phone: float = Field(default=0, ge=0)
+    click_website: float = Field(default=0, ge=0)
+    click_route: float = Field(default=0, ge=0)
+    click_messengers: float = Field(default=0, ge=0)
+    click_book_story: float = Field(default=0, ge=0)
+    map_zoom_clicks: float = Field(default=0, ge=0)
+
+
 class CardCreateRequest(BaseModel):
     name: str
     settings: CardSettingsRequest | None = None
@@ -106,6 +126,28 @@ def _coerce_card_settings(settings: dict[str, str]) -> dict[str, object]:
     defaults = CardSettingsRequest().model_dump()
     result: dict[str, object] = dict(defaults)
     for key, value in settings.items():
+        if key not in defaults:
+            continue
+        default_value = defaults[key]
+        if isinstance(default_value, bool):
+            result[key] = value.strip().lower() in {"1", "true", "yes", "on"}
+        elif isinstance(default_value, (int, float)):
+            try:
+                result[key] = float(value)
+            except (TypeError, ValueError):
+                result[key] = default_value
+        else:
+            result[key] = value
+    return result
+
+
+def _coerce_card_defaults(stored: dict[str, str]) -> dict[str, object]:
+    defaults = CardDefaultsRequest().model_dump()
+    result: dict[str, object] = dict(defaults)
+    for full_key, value in stored.items():
+        if not full_key.startswith(CARD_DEFAULTS_PREFIX):
+            continue
+        key = full_key[len(CARD_DEFAULTS_PREFIX):]
         if key not in defaults:
             continue
         default_value = defaults[key]
@@ -266,6 +308,20 @@ def create_app(base_dir: Path | None = None, services: AppServices | None = None
     @app.post("/api/settings")
     def save_settings(payload: SettingsRequest) -> dict:
         resolved_services.settings_service.save_settings(payload.model_dump())
+        return {"ok": True}
+
+    @app.get("/api/card-defaults")
+    def get_card_defaults() -> dict[str, object]:
+        stored = resolved_services.settings_service.load_settings()
+        return _coerce_card_defaults(stored)
+
+    @app.post("/api/card-defaults")
+    def save_card_defaults(payload: CardDefaultsRequest) -> dict:
+        prefixed = {
+            f"{CARD_DEFAULTS_PREFIX}{key}": value
+            for key, value in payload.model_dump().items()
+        }
+        resolved_services.settings_service.save_settings(prefixed)
         return {"ok": True}
 
     @app.get("/api/cards/{card_id}/settings")

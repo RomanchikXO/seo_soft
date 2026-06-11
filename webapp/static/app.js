@@ -78,6 +78,23 @@ const NUMERIC_FIELD_CONFIG = [
   },
 ];
 
+const DEFAULT_FIELD_KEYS = [
+  "competitor_open_chance_percent",
+  "max_open_competitor_cards",
+  "min_sleep_competitor_card_sec",
+  "max_sleep_competitor_card_sec",
+  "min_sleep_target_overview_sec",
+  "max_sleep_target_overview_sec",
+  "min_sleep_target_tab_sec",
+  "max_sleep_target_tab_sec",
+  "click_show_phone",
+  "click_website",
+  "click_route",
+  "click_messengers",
+  "click_book_story",
+  "map_zoom_clicks",
+];
+
 const TELEGRAM_PROXY_PATTERN = /^https?:\/\/(?:[^\s:@/]+(?::[^\s:@/]*)?@)?[^\s:@/]+:\d{1,5}\/?$/;
 
 const state = {
@@ -97,6 +114,7 @@ const state = {
   tasks: [],
   taskSeq: 0,
   tasksCountdownTimer: null,
+  cardDefaults: null,
 };
 
 const WEEKDAYS = [
@@ -163,6 +181,11 @@ const ui = {
   saveGlobalSettingsBtn: document.getElementById("saveGlobalSettingsBtn"),
   settingsModal: document.getElementById("settingsModal"),
   settingsModalTitle: document.getElementById("settingsModalTitle"),
+  applyDefaultsBtn: document.getElementById("applyDefaultsBtn"),
+  openDefaultsConfigBtn: document.getElementById("openDefaultsConfigBtn"),
+  defaultsConfigModal: document.getElementById("defaultsConfigModal"),
+  closeDefaultsConfigBtn: document.getElementById("closeDefaultsConfigBtn"),
+  saveDefaultsConfigBtn: document.getElementById("saveDefaultsConfigBtn"),
   cardNameInput: document.getElementById("cardNameInput"),
   yandexOrgUrlInput: document.getElementById("yandexOrgUrlInput"),
   autofillYandexOrgBtn: document.getElementById("autofillYandexOrgBtn"),
@@ -221,6 +244,7 @@ async function startup() {
     await api("/api/health");
     setInitProgress(65, "Загрузка карточек...");
     await loadCards();
+    await ensureCardDefaultsLoaded();
     setInitProgress(100, "Готово");
     setTimeout(() => ui.initScreen.classList.add("hidden"), 250);
   } catch (error) {
@@ -437,6 +461,75 @@ function collectSettingsPayload() {
     payload[field.key] = parseNonNegativeNumber(ui[field.inputKey].value, field.label);
   }
   return payload;
+}
+
+function numericFieldConfigByKey(key) {
+  return NUMERIC_FIELD_CONFIG.find((field) => field.key === key);
+}
+
+async function ensureCardDefaultsLoaded() {
+  if (state.cardDefaults) return state.cardDefaults;
+  try {
+    state.cardDefaults = await api("/api/card-defaults");
+  } catch (_error) {
+    state.cardDefaults = null;
+  }
+  return state.cardDefaults;
+}
+
+async function applyCardDefaultsToSettingsForm() {
+  const defaults = await ensureCardDefaultsLoaded();
+  if (!defaults) {
+    alert("Не удалось загрузить значения по умолчанию.");
+    return;
+  }
+  for (const key of DEFAULT_FIELD_KEYS) {
+    const config = numericFieldConfigByKey(key);
+    if (config && ui[config.inputKey]) {
+      ui[config.inputKey].value = String(defaults[key] ?? 0);
+    }
+  }
+}
+
+function fillDefaultsConfigForm(defaults) {
+  for (const key of DEFAULT_FIELD_KEYS) {
+    const input = document.getElementById(`default_${key}`);
+    if (!input) continue;
+    input.value = String(defaults[key] ?? 0);
+  }
+}
+
+async function openDefaultsConfigModal() {
+  const defaults = (await ensureCardDefaultsLoaded()) || {};
+  fillDefaultsConfigForm(defaults);
+  ui.defaultsConfigModal.classList.remove("hidden");
+}
+
+function collectDefaultsPayload() {
+  const payload = {};
+  for (const key of DEFAULT_FIELD_KEYS) {
+    const input = document.getElementById(`default_${key}`);
+    const config = numericFieldConfigByKey(key);
+    payload[key] = parseNonNegativeNumber(input ? input.value : 0, config ? config.label : key);
+  }
+  return payload;
+}
+
+async function saveDefaultsConfig() {
+  let payload;
+  try {
+    payload = collectDefaultsPayload();
+  } catch (error) {
+    alert(error.message);
+    return;
+  }
+  try {
+    await api("/api/card-defaults", { method: "POST", body: JSON.stringify(payload) });
+    state.cardDefaults = payload;
+    ui.defaultsConfigModal.classList.add("hidden");
+  } catch (error) {
+    alert(`Не удалось сохранить значения по умолчанию: ${error.message}`);
+  }
 }
 
 function setAutofillStatus(message, type = "") {
@@ -1118,6 +1211,15 @@ ui.settingsModal.onclick = (event) => {
 };
 ui.saveSettingsBtn.onclick = saveSettings;
 ui.autofillYandexOrgBtn.onclick = autofillByYandexOrgUrl;
+ui.applyDefaultsBtn.onclick = applyCardDefaultsToSettingsForm;
+ui.openDefaultsConfigBtn.onclick = openDefaultsConfigModal;
+ui.closeDefaultsConfigBtn.onclick = () => ui.defaultsConfigModal.classList.add("hidden");
+ui.saveDefaultsConfigBtn.onclick = saveDefaultsConfig;
+ui.defaultsConfigModal.onclick = (event) => {
+  if (event.target === ui.defaultsConfigModal) {
+    ui.defaultsConfigModal.classList.add("hidden");
+  }
+};
 window.addEventListener("pagehide", requestShutdownOnClose);
 
 syncOptimizationThreadsUi();
