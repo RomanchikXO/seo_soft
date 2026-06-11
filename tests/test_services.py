@@ -271,6 +271,26 @@ def test_notification_sends_when_telegram_configured(tmp_path: Path) -> None:
     assert "Оптимизация завершена" in text
 
 
+def test_notification_sends_to_multiple_chat_ids(tmp_path: Path) -> None:
+    repo = SqliteRepository(tmp_path / "svc.db")
+    settings = SettingsService(repo)
+    settings.save_settings({"telegram_token": "token-123", "telegram_chat_id": "111, 222 ; 333"})
+    notifier = _FakeNotifier()
+    service = NotificationService(settings_service=settings, notifier=notifier)
+
+    sent = service.notify_optimization_finished(_optimization_summary(), background=False)
+    assert sent is True
+    assert [entry[1] for entry in notifier.sent] == ["111", "222", "333"]
+
+
+def test_notification_parse_chat_ids() -> None:
+    assert NotificationService.parse_chat_ids("111, 222 ; 333") == ["111", "222", "333"]
+    assert NotificationService.parse_chat_ids(" 999 ") == ["999"]
+    assert NotificationService.parse_chat_ids("111\n222 111") == ["111", "222"]
+    assert NotificationService.parse_chat_ids("") == []
+    assert NotificationService.parse_chat_ids(None) == []
+
+
 def test_notification_passes_valid_proxy(tmp_path: Path) -> None:
     repo = SqliteRepository(tmp_path / "svc.db")
     settings = SettingsService(repo)

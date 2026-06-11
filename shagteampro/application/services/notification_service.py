@@ -51,7 +51,8 @@ class NotificationService:
         При background=True фактическая сетевая отправка идет в отдельном потоке.
         """
         token, chat_id, proxy = self._load_credentials()
-        if not token or not chat_id:
+        chat_ids = self.parse_chat_ids(chat_id)
+        if not token or not chat_ids:
             self._log("NotificationService: Telegram не настроен, уведомление пропущено.")
             return False
 
@@ -62,14 +63,41 @@ class NotificationService:
         text = self.build_optimization_message(summary)
         if background:
             thread = threading.Thread(
-                target=self._notifier.send_message,
-                args=(token, chat_id, text, proxy),
+                target=self._send_to_all,
+                args=(token, chat_ids, text, proxy),
                 name="telegram-notify",
                 daemon=True,
             )
             thread.start()
             return True
-        return self._notifier.send_message(token, chat_id, text, proxy)
+        return self._send_to_all(token, chat_ids, text, proxy)
+
+    def _send_to_all(self, token: str, chat_ids: list[str], text: str, proxy: str) -> bool:
+        """Отправляет одно сообщение всем получателям. True, если хотя бы один успех."""
+        any_sent = False
+        for chat_id in chat_ids:
+            if self._notifier.send_message(token, chat_id, text, proxy):
+                any_sent = True
+            else:
+                self._log(f"NotificationService: не удалось отправить уведомление для chat_id '{chat_id}'.")
+        return any_sent
+
+    @staticmethod
+    def parse_chat_ids(raw: object) -> list[str]:
+        """Разбирает строку получателей в список chat_id.
+
+        Идентификаторы можно перечислять через запятую, точку с запятой, пробелы
+        или переводы строк. Дубликаты убираются с сохранением порядка.
+        """
+        text = str(raw or "")
+        seen: set[str] = set()
+        result: list[str] = []
+        for chunk in re.split(r"[\s,;]+", text):
+            chat_id = chunk.strip()
+            if chat_id and chat_id not in seen:
+                seen.add(chat_id)
+                result.append(chat_id)
+        return result
 
     def _load_credentials(self) -> tuple[str, str, str]:
         settings = self._settings_service.load_settings()
