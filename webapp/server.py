@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import os
 import tempfile
 from dataclasses import dataclass
@@ -408,9 +409,14 @@ def create_app(base_dir: Path | None = None, services: AppServices | None = None
                 }
             )
 
+        started_at = datetime.datetime.now()
         summary = resolved_services.search_runner_service.run_cards_optimization(
             cards_payload, payload.threads
         )
+        finished_at = datetime.datetime.now()
+        summary["started_at"] = started_at.isoformat()
+        summary["finished_at"] = finished_at.isoformat()
+        summary["duration_seconds"] = (finished_at - started_at).total_seconds()
 
         if resolved_services.notification_service is not None:
             try:

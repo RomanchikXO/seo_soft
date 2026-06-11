@@ -131,6 +131,31 @@ def test_notification_message_contains_statistics() -> None:
     assert "Card B" in text
 
 
+def test_notification_message_includes_timing() -> None:
+    summary = _optimization_summary()
+    summary["started_at"] = "2026-06-11T23:10:05"
+    summary["finished_at"] = "2026-06-11T23:25:40"
+    summary["duration_seconds"] = 935.0
+    text = NotificationService.build_optimization_message(summary)
+    assert "🟢 Начало работы: <i>11.06.2026 23:10:05</i>" in text
+    assert "🔴 Завершение: <i>11.06.2026 23:25:40</i>" in text
+    assert "⏱ Затрачено времени: <b>15 мин 35 сек</b>" in text
+
+
+def test_notification_message_timing_optional() -> None:
+    text = NotificationService.build_optimization_message(_optimization_summary())
+    assert "Завершение:" in text
+    assert "Начало работы:" not in text
+    assert "Затрачено времени:" not in text
+
+
+def test_notification_duration_formatting() -> None:
+    assert NotificationService._format_duration(0) == "0 сек"
+    assert NotificationService._format_duration(45) == "45 сек"
+    assert NotificationService._format_duration(125) == "2 мин 5 сек"
+    assert NotificationService._format_duration(3725) == "1 ч 2 мин 5 сек"
+
+
 def test_notification_percent_suffix_and_card_states() -> None:
     assert NotificationService._percent_suffix(4, 5) == " (80%)"
     assert NotificationService._percent_suffix(0, 0) == ""

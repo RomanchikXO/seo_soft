@@ -96,16 +96,20 @@ class NotificationService:
         total_done = search_done + maps_done
         total_target = search_target + maps_target
 
-        timestamp = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+        started_display, finished_display, duration_display = NotificationService._extract_timing(summary)
 
         cards = summary.get("cards", [])
         typed_cards = cards if isinstance(cards, list) else []
 
         completed_cards, partial_cards, idle_cards = NotificationService._count_card_states(typed_cards)
 
-        lines = [
-            "<b>✅ Оптимизация завершена</b>",
-            f"<i>{html.escape(timestamp)}</i>",
+        lines = ["<b>✅ Оптимизация завершена</b>"]
+        if started_display:
+            lines.append(f"🟢 Начало работы: <i>{html.escape(started_display)}</i>")
+        lines.append(f"🔴 Завершение: <i>{html.escape(finished_display)}</i>")
+        if duration_display:
+            lines.append(f"⏱ Затрачено времени: <b>{html.escape(duration_display)}</b>")
+        lines.extend([
             "",
             f"📇 Обработано карточек: <b>{processed}</b>",
             f"🔍 Переходы в поиске: <b>{search_done}/{search_target}</b>"
@@ -120,7 +124,7 @@ class NotificationService:
             f"✅ Полностью: <b>{completed_cards}</b>",
             f"🟡 Частично: <b>{partial_cards}</b>",
             f"⛔️ Без результата: <b>{idle_cards}</b>",
-        ]
+        ])
         action_totals = summary.get("total_action_counts", {})
         typed_action_totals = action_totals if isinstance(action_totals, dict) else {}
 
@@ -164,6 +168,60 @@ class NotificationService:
             return ""
         percent = int(round(min(done, target) * 100 / target))
         return f" ({percent}%)"
+
+    @staticmethod
+    def _parse_iso(value: object) -> datetime.datetime | None:
+        """Парсит ISO-строку времени, возвращая None при ошибке/отсутствии."""
+        if not value:
+            return None
+        try:
+            return datetime.datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        """Форматирует длительность в человекочитаемый вид (ч/мин/сек)."""
+        total = max(0, int(round(seconds)))
+        hours = total // 3600
+        minutes = (total % 3600) // 60
+        secs = total % 60
+        parts: list[str] = []
+        if hours:
+            parts.append(f"{hours} ч")
+        if minutes:
+            parts.append(f"{minutes} мин")
+        parts.append(f"{secs} сек")
+        return " ".join(parts)
+
+    @staticmethod
+    def _extract_timing(summary: dict[str, object]) -> tuple[str, str, str]:
+        """Возвращает отображаемые строки (начало, завершение, длительность).
+
+        Если время начала/завершения не передано — завершение берется как
+        текущий момент, а начало и длительность опускаются (обратная совместимость).
+        """
+        time_format = "%d.%m.%Y %H:%M:%S"
+        started_dt = NotificationService._parse_iso(summary.get("started_at"))
+        finished_dt = NotificationService._parse_iso(summary.get("finished_at"))
+        if finished_dt is None:
+            finished_dt = datetime.datetime.now()
+
+        started_display = started_dt.strftime(time_format) if started_dt else ""
+        finished_display = finished_dt.strftime(time_format)
+
+        duration_seconds = summary.get("duration_seconds")
+        if duration_seconds is None and started_dt is not None:
+            duration_seconds = (finished_dt - started_dt).total_seconds()
+
+        duration_display = ""
+        if duration_seconds is not None:
+            try:
+                duration_display = NotificationService._format_duration(float(duration_seconds))
+            except (TypeError, ValueError):
+                duration_display = ""
+
+        return started_display, finished_display, duration_display
 
     @staticmethod
     def _count_card_states(cards: list[dict[str, object]]) -> tuple[int, int, int]:
