@@ -109,6 +109,7 @@ class SettingsRequest(BaseModel):
     coordinates: str = ""
     captcha_service: str = "manual"
     capsola_token: str = ""
+    botlab_token: str = ""
     telegram_token: str = ""
     telegram_chat_id: str = ""
     telegram_proxy: str = ""

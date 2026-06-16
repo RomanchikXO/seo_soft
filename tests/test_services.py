@@ -338,6 +338,240 @@ def test_search_runner_build_query() -> None:
     assert SearchRunnerService._build_query("alpha", "", "Arbat") == "alpha Arbat"
 
 
+class _FakeLocator:
+    """Заглушка локатора Playwright: элемент закрытия модалки отсутствует."""
+
+    def first_dummy(self) -> "_FakeLocator":
+        return self
+
+    @property
+    def first(self) -> "_FakeLocator":
+        return self
+
+    def count(self) -> int:
+        return 0
+
+    def is_visible(self) -> bool:
+        return False
+
+
+class _FakeKeyboard:
+    """Заглушка клавиатуры: копит нажатые клавиши."""
+
+    def __init__(self) -> None:
+        self.pressed: list[str] = []
+
+    def press(self, key: str) -> None:
+        self.pressed.append(key)
+
+
+class _FakeModalPage:
+    """Минимальная фейковая страница для проверки гашения промо-модалки."""
+
+    def __init__(self, removed_overlays: int) -> None:
+        self._removed_overlays = removed_overlays
+        self.evaluated: list[str] = []
+        self.keyboard = _FakeKeyboard()
+
+    def locator(self, _selector: str) -> _FakeLocator:
+        return _FakeLocator()
+
+    def wait_for_timeout(self, _ms: int) -> None:
+        return None
+
+    def wait_for_load_state(self, _state: str, timeout: int = 0) -> None:
+        return None
+
+    def evaluate(self, script: str) -> int:
+        self.evaluated.append(script)
+        return self._removed_overlays
+
+
+class _ClickableCloseLocator:
+    """Заглушка локатора видимой кнопки закрытия промо-модалки."""
+
+    def __init__(self, clicks: list[bool]) -> None:
+        self._clicks = clicks
+
+    @property
+    def first(self) -> "_ClickableCloseLocator":
+        return self
+
+    def count(self) -> int:
+        return 1
+
+    def is_visible(self) -> bool:
+        return True
+
+    def click(self, force: bool = False) -> None:
+        self._clicks.append(force)
+
+
+class _ModalWithCloseButtonPage:
+    """Фейковая страница с видимой кнопкой закрытия промо-модалки."""
+
+    def __init__(self) -> None:
+        self.clicks: list[bool] = []
+        self.evaluated: list[str] = []
+        self.keyboard = _FakeKeyboard()
+
+    def locator(self, _selector: str) -> _ClickableCloseLocator:
+        return _ClickableCloseLocator(self.clicks)
+
+    def wait_for_timeout(self, _ms: int) -> None:
+        return None
+
+    def wait_for_load_state(self, _state: str, timeout: int = 0) -> None:
+        return None
+
+    def evaluate(self, script: str) -> int:
+        self.evaluated.append(script)
+        return 0
+
+
+def test_dismiss_distribution_modal_removes_splash_without_close_button() -> None:
+    service = SearchRunnerService()
+    page = _FakeModalPage(removed_overlays=2)
+
+    service._dismiss_distribution_modal(page, context="overview")
+
+    assert any("DistributionSplashScreen" in script for script in page.evaluated)
+    assert page.keyboard.pressed == ["Escape", "Escape", "Escape"]
+
+
+def test_dismiss_distribution_modal_clicks_close_button_and_always_presses_escape() -> None:
+    service = SearchRunnerService()
+    page = _ModalWithCloseButtonPage()
+
+    service._dismiss_distribution_modal(page, context="overview")
+
+    # Клик по кнопке закрытия выполнен, JS-удаление не понадобилось,
+    # но Esc всё равно жмётся 3 раза как страховка.
+    assert page.clicks == [True]
+    assert page.evaluated == []
+    assert page.keyboard.pressed == ["Escape", "Escape", "Escape"]
+
+
+class _PhotoViewerPage:
+    """Фейковая страница лайтбокса фото.
+
+    Видимую кнопку закрытия отдаёт только для заданного селектора, что
+    позволяет проверить выбор специфичного для просмотрщика селектора.
+    """
+
+    def __init__(self, visible_selector: str | None) -> None:
+        self._visible_selector = visible_selector
+        self.clicks: list[bool] = []
+        self.keyboard = _FakeKeyboard()
+
+    def locator(self, selector: str):
+        clicks = self.clicks
+        is_match = selector == self._visible_selector
+
+        class _Locator:
+            @property
+            def first(self) -> "_Locator":
+                return self
+
+            def count(self) -> int:
+                return 1 if is_match else 0
+
+            def is_visible(self) -> bool:
+                return is_match
+
+            def click(self, force: bool = False) -> None:
+                clicks.append(force)
+
+        return _Locator()
+
+    def wait_for_timeout(self, _ms: int) -> None:
+        return None
+
+
+def test_close_photo_viewer_clicks_lightbox_button_without_escape() -> None:
+    service = SearchRunnerService()
+    page = _PhotoViewerPage(visible_selector=".MediaViewer-ButtonClose")
+
+    service._close_photo_viewer(page)
+
+    assert page.clicks == [True]
+    assert page.keyboard.pressed == []
+
+
+def test_close_photo_viewer_does_not_press_escape_when_button_absent() -> None:
+    service = SearchRunnerService()
+    page = _PhotoViewerPage(visible_selector=None)
+
+    service._close_photo_viewer(page)
+
+    # Внутри модалки карты Esc запрещён — он закрыл бы всю карточку.
+    assert page.clicks == []
+    assert page.keyboard.pressed == []
+
+
+class _OrgHeaderLocator:
+    """Заглушка локатора заголовка открытой карточки организации."""
+
+    def __init__(self, header_text: str | None, visible: bool) -> None:
+        self._header_text = header_text
+        self._visible = visible
+
+    @property
+    def first(self) -> "_OrgHeaderLocator":
+        return self
+
+    def count(self) -> int:
+        return 1 if self._header_text is not None else 0
+
+    def is_visible(self) -> bool:
+        return self._visible
+
+    def inner_text(self) -> str:
+        return self._header_text or ""
+
+
+class _CardWaitPage:
+    """Фейковая страница для проверки детекта открытия карточки организации."""
+
+    def __init__(self, header_text: str | None, visible: bool = True) -> None:
+        self._header_text = header_text
+        self._visible = visible
+
+    def locator(self, _selector: str) -> _OrgHeaderLocator:
+        return _OrgHeaderLocator(self._header_text, self._visible)
+
+    def wait_for_timeout(self, _ms: int) -> None:
+        return None
+
+
+def test_wait_for_organization_card_opened_true_when_header_matches() -> None:
+    service = SearchRunnerService()
+    page = _CardWaitPage(header_text="Каракилис")
+    assert service._wait_for_organization_card_opened(page, "Каракилис") is True
+
+
+def test_wait_for_organization_card_opened_false_for_other_org() -> None:
+    service = SearchRunnerService()
+    page = _CardWaitPage(header_text="Джонджоли")
+    assert service._wait_for_organization_card_opened(page, "Каракилис") is False
+
+
+def test_wait_for_organization_card_opened_false_when_header_absent() -> None:
+    service = SearchRunnerService()
+    page = _CardWaitPage(header_text=None, visible=False)
+    assert service._wait_for_organization_card_opened(page, "Каракилис") is False
+
+
+def test_remove_distribution_overlays_swallows_evaluate_errors() -> None:
+    service = SearchRunnerService()
+
+    class _BrokenPage:
+        def evaluate(self, _script: str) -> int:
+            raise RuntimeError("page closed")
+
+    assert service._remove_distribution_overlays(_BrokenPage()) == 0
+
+
 def test_search_runner_build_maps_url_with_trimmed_coordinates() -> None:
     maps_url = SearchRunnerService._build_maps_url({"coordinates": " 37.631182, 55.771363 "})
     assert maps_url == "https://yandex.ru/maps/?ll=37.631182,55.771363&z=17&lang=ru_RU"
@@ -478,6 +712,150 @@ def test_search_runner_optimization_runs_search_and_maps_for_same_card(
     assert result["total_maps_performed"] == 3
     assert result["cards"][0]["search_effect_keys"] == [10]
     assert result["cards"][0]["maps_effect_keys"] == [10]
+
+
+def test_search_runner_retries_single_key_until_failure_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SearchRunnerService()
+    monkeypatch.setattr(service, "ensure_chromium_installed", lambda: False)
+    calls: list[int] = []
+
+    def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]) -> bool:
+        calls.append(int(key_payload["id"]))
+        return False
+
+    monkeypatch.setattr(service, "_simulate_search_action", fake_search)
+
+    result = service.run_cards_optimization(
+        cards=[
+            {
+                "card_id": 1,
+                "card_name": "Card",
+                "search_target": 4,
+                "maps_target": 0,
+                "keys": [{"id": 10, "search_enabled": True, "maps_enabled": False}],
+            }
+        ],
+        threads=1,
+    )
+
+    assert len(calls) == 4
+    assert result["total_search_performed"] == 0
+
+
+def test_is_browser_closed_error_detects_target_closed() -> None:
+    class _TargetClosedError(Exception):
+        pass
+
+    assert SearchRunnerService._is_browser_closed_error(
+        _TargetClosedError("Target page, context or browser has been closed")
+    ) is True
+    assert SearchRunnerService._is_browser_closed_error(
+        RuntimeError("Browser closed unexpectedly")
+    ) is True
+    assert SearchRunnerService._is_browser_closed_error(
+        ValueError("organization not found")
+    ) is False
+
+
+def test_search_runner_browser_close_does_not_consume_failure_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SearchRunnerService()
+    monkeypatch.setattr(service, "ensure_chromium_installed", lambda: False)
+    # Сначала несколько закрытий браузера (без штрафа), затем успешные переходы.
+    outcomes = iter(
+        [
+            {"effect": False, "actions": {}, "closed": True},
+            {"effect": False, "actions": {}, "closed": True},
+            {"effect": False, "actions": {}, "closed": True},
+            True,
+            True,
+        ]
+    )
+
+    def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]):
+        return next(outcomes)
+
+    monkeypatch.setattr(service, "_simulate_search_action", fake_search)
+
+    result = service.run_cards_optimization(
+        cards=[
+            {
+                "card_id": 1,
+                "card_name": "Card",
+                "search_target": 2,
+                "maps_target": 0,
+                "keys": [{"id": 10, "search_enabled": True, "maps_enabled": False}],
+            }
+        ],
+        threads=1,
+    )
+
+    assert result["total_search_performed"] == 2
+
+
+def test_search_runner_single_key_recovers_after_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SearchRunnerService()
+    monkeypatch.setattr(service, "ensure_chromium_installed", lambda: False)
+    outcomes = iter([False, True, True])
+
+    def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]) -> bool:
+        return next(outcomes)
+
+    monkeypatch.setattr(service, "_simulate_search_action", fake_search)
+
+    result = service.run_cards_optimization(
+        cards=[
+            {
+                "card_id": 1,
+                "card_name": "Card",
+                "search_target": 2,
+                "maps_target": 0,
+                "keys": [{"id": 10, "search_enabled": True, "maps_enabled": False}],
+            }
+        ],
+        threads=1,
+    )
+
+    assert result["total_search_performed"] == 2
+
+
+def test_search_runner_drops_unproductive_key_when_alternatives_exist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SearchRunnerService()
+    monkeypatch.setattr(service, "ensure_chromium_installed", lambda: False)
+    calls: list[int] = []
+
+    def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]) -> bool:
+        key_id = int(key_payload["id"])
+        calls.append(key_id)
+        return key_id == 20
+
+    monkeypatch.setattr(service, "_simulate_search_action", fake_search)
+
+    result = service.run_cards_optimization(
+        cards=[
+            {
+                "card_id": 1,
+                "card_name": "Card",
+                "search_target": 2,
+                "maps_target": 0,
+                "keys": [
+                    {"id": 10, "search_enabled": True, "maps_enabled": False},
+                    {"id": 20, "search_enabled": True, "maps_enabled": False},
+                ],
+            }
+        ],
+        threads=1,
+    )
+
+    assert result["total_search_performed"] == 2
+    assert result["cards"][0]["search_effect_keys"] == [20]
 
 
 def test_search_runner_maps_mode_uses_card_activity_settings(

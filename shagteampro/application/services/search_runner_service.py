@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime
+import logging
 import os
 import random
 import shutil
@@ -9,11 +10,40 @@ import subprocess
 import sys
 import threading
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Iterable
 
 from shagteampro.application.captcha import CaptchaService
 from shagteampro.application.services.settings_service import SettingsService
+
+_RUN_LOG_PATH = Path.home() / ".shagteampro" / "logs" / "run.log"
+_run_logger: logging.Logger | None = None
+_run_logger_lock = threading.Lock()
+
+
+def _get_run_logger() -> logging.Logger:
+    """Лениво создаёт общий на процесс файловый логгер прогонов с ротацией.
+
+    Логи дублируются в `~/.shagteampro/logs/run.log`, чтобы прогон сохранялся
+    целиком и не терялся при перезаписи буфера терминала.
+    """
+    global _run_logger
+    if _run_logger is not None:
+        return _run_logger
+    with _run_logger_lock:
+        if _run_logger is None:
+            _RUN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            logger = logging.getLogger("shagteampro.run")
+            logger.setLevel(logging.INFO)
+            logger.propagate = False
+            handler = RotatingFileHandler(
+                _RUN_LOG_PATH, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+            )
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            logger.addHandler(handler)
+            _run_logger = logger
+    return _run_logger
 
 
 class _ActionBudget:
@@ -90,7 +120,11 @@ class SearchRunnerService:
         if service_type == "capsola":
             from shagteampro.application.captcha.solvers.capsola import CapsolaCaptchaSolver
             token = settings.get("capsola_token", "")
-            solver = CapsolaCaptchaSolver(token=token)
+            solver = CapsolaCaptchaSolver(token=token, logger=self._log)
+        elif service_type == "botlab":
+            from shagteampro.application.captcha.solvers.botlab import BotlabCaptchaSolver
+            token = settings.get("botlab_token", "")
+            solver = BotlabCaptchaSolver(token=token, logger=self._log)
         else:
             from shagteampro.application.captcha.solvers.manual import ManualCaptchaSolver
             solver = ManualCaptchaSolver()
@@ -140,30 +174,55 @@ class SearchRunnerService:
             executed_count = 0
             try:
                 for query in queries:
-                    self._log(f"Открываю ya.ru для запроса: {query}")
-                    page.goto("https://ya.ru/", wait_until="domcontentloaded")
-                    page.wait_for_timeout(2000)
-                    search_input = self._get_search_input(page)
-                    page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
-                    self._type_query_and_submit(page, search_input, query)
-                    resolution = self._handle_captcha_if_present(page, context=f"после отправки запроса '{query}'")
-                    page.wait_for_timeout(random.randint(2500, 4200))
-                    
-                    if not resolution.detected or resolution.solved:
-                        self._log("run_yandex_searches: нажимаю Esc 3 раза с интервалом 0.5с")
-                        for _ in range(3):
-                            page.keyboard.press("Escape")
-                            page.wait_for_timeout(500)
-                            
-                    executed_count += 1
-                    self._log(f"Запрос обработан успешно. Выполнено: {executed_count}/{len(queries)}")
-            except PlaywrightTimeoutError:
-                self._log(f"Таймаут в run_yandex_searches. Успешно выполнено: {executed_count}")
-                return executed_count
+                    # Каждый запрос изолирован: ошибка/ручное закрытие браузера на одном
+                    # запросе не должны рушить весь пакетный прогон.
+                    try:
+                        if not self._is_page_alive(page):
+                            self._log("run_yandex_searches: страница/браузер недоступны, пересоздаю сессию.")
+                            context, browser, page = self._recreate_session(
+                                playwright, browsers_path, context, browser
+                            )
+
+                        self._log(f"Открываю ya.ru для запроса: {query}")
+                        page.goto("https://ya.ru/", wait_until="domcontentloaded")
+                        page.wait_for_timeout(2000)
+                        search_input = self._get_search_input(page)
+                        page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
+                        self._type_query_and_submit(page, search_input, query)
+                        resolution = self._handle_captcha_if_present(page, context=f"после отправки запроса '{query}'")
+                        page.wait_for_timeout(random.randint(2500, 4200))
+
+                        if not resolution.detected or resolution.solved:
+                            self._dismiss_distribution_modal(page, context="run_yandex_searches")
+
+                        executed_count += 1
+                        self._log(f"Запрос обработан успешно. Выполнено: {executed_count}/{len(queries)}")
+                    except PlaywrightTimeoutError:
+                        self._log(f"Таймаут на запросе '{query}', перехожу к следующему.")
+                        continue
+                    except Exception as error:
+                        self._log(f"Ошибка на запросе '{query}': {error}. Перехожу к следующему.")
+                        continue
             finally:
                 self._close_browser_session(context, browser, "run_yandex_searches")
         self._log(f"Пакетный поиск завершен. Итого выполнено: {executed_count}")
         return executed_count
+
+    @staticmethod
+    def _is_page_alive(page) -> bool:
+        """Проверяет, что страница и её браузер ещё открыты (не закрыты вручную)."""
+        try:
+            return not page.is_closed() and page.context.browser.is_connected()
+        except Exception:
+            return False
+
+    def _recreate_session(self, playwright, browsers_path: Path, old_context, old_browser):
+        """Закрывает мёртвую сессию и поднимает новую (браузер/контекст/страница)."""
+        self._close_browser_session(old_context, old_browser, "run_yandex_searches:recreate")
+        browser = self._launch_chromium_with_recovery(playwright, browsers_path)
+        context = self._create_human_like_context(browser)
+        page = context.new_page()
+        return context, browser, page
 
     def run_cards_optimization(self, cards: list[dict[str, object]], threads: int) -> dict[str, object]:
         """Запускает оптимизацию карточек по выбранным поисковым и картографическим ключам."""
@@ -253,6 +312,7 @@ class SearchRunnerService:
                         "target": target,
                         "active_keys": list(keys),
                         "performed": 0,
+                        "failures": 0,
                         "in_flight": 0,
                         "effect_key_ids": set(),
                         "action_counts": {},
@@ -355,15 +415,47 @@ class SearchRunnerService:
                     f"Карточка #{state['card_id']}: {state['mode']} засчитано "
                     f"{state['performed']}/{state['target']}."
                 )
+        elif result.get("closed"):
+            self._log(
+                f"Карточка #{state['card_id']}: {state['mode']} — браузер закрыт вручную или потерян, "
+                f"переоткрываю без штрафа."
+            )
         else:
-            try:
-                state["active_keys"].remove(key_payload)
-            except ValueError:
-                pass
-            if not state["active_keys"] and state["performed"] < state["target"]:
-                self._log(
-                    f"Карточка #{state['card_id']}: {state['mode']} — закончились результативные ключи."
-                )
+            self._handle_failed_action(state, key_payload)
+
+    def _handle_failed_action(
+        self,
+        state: dict[str, object],
+        key_payload: dict[str, object],
+    ) -> None:
+        """Обрабатывает неуспешный переход: переключает ключ или повторяет попытку.
+
+        Если у цели есть другие ключи, текущий считается непродуктивным и
+        убирается. Если ключ единственный, провал трактуется как транзитный
+        (не открылась карта/капча) и попытка повторяется до исчерпания бюджета
+        в `target` неудач — это защищает от зацикливания, но не обнуляет цель
+        после первой же ошибки.
+        """
+        state["failures"] += 1
+        card_id = state["card_id"]
+        mode = state["mode"]
+
+        if len(state["active_keys"]) > 1:
+            state["active_keys"].remove(key_payload)
+            return
+
+        if state["failures"] >= state["target"]:
+            state["active_keys"].clear()
+            self._log(
+                f"Карточка #{card_id}: {mode} — исчерпан лимит неудачных попыток "
+                f"({state['failures']}/{state['target']}), останавливаю."
+            )
+            return
+
+        self._log(
+            f"Карточка #{card_id}: {mode} — неудачная попытка "
+            f"{state['failures']}/{state['target']}, повторю с тем же ключом."
+        )
 
     def _execute_single_action(
         self, state: dict[str, object], key_payload: dict[str, object]
@@ -383,14 +475,36 @@ class SearchRunnerService:
 
     @staticmethod
     def _normalize_action_result(raw: object) -> dict[str, object]:
-        """Приводит результат действия к виду {'effect': bool, 'actions': dict}."""
+        """Приводит результат действия к виду {'effect': bool, 'actions': dict, 'closed': bool}."""
         if isinstance(raw, dict):
             actions = raw.get("actions") or {}
             return {
                 "effect": bool(raw.get("effect")),
                 "actions": dict(actions) if isinstance(actions, dict) else {},
+                "closed": bool(raw.get("closed")),
             }
-        return {"effect": bool(raw), "actions": {}}
+        return {"effect": bool(raw), "actions": {}, "closed": False}
+
+    _BROWSER_CLOSED_MARKERS: tuple[str, ...] = (
+        "has been closed",
+        "target closed",
+        "targetclosederror",
+        "browser closed",
+        "browser has been closed",
+        "connection closed",
+        "page, context or browser has been closed",
+    )
+
+    @staticmethod
+    def _is_browser_closed_error(error: Exception) -> bool:
+        """Определяет, что ошибка вызвана закрытием/потерей браузера (в т.ч. вручную).
+
+        Такое событие считается транзитным: поток переоткрывается без расхода
+        бюджета неудач, поэтому ручное закрытие одного браузера не останавливает
+        работу всей программы.
+        """
+        text = f"{type(error).__name__} {error}".lower()
+        return any(marker in text for marker in SearchRunnerService._BROWSER_CLOSED_MARKERS)
 
     @staticmethod
     def _card_key_payloads(card_payload: dict[str, object]) -> list[dict[str, object]]:
@@ -448,7 +562,9 @@ class SearchRunnerService:
             "cards": results,
         }
 
-    def _simulate_search_action(self, key_payload: dict[str, object], card_payload: dict[str, object]) -> bool:
+    def _simulate_search_action(
+        self, key_payload: dict[str, object], card_payload: dict[str, object]
+    ) -> dict[str, object] | bool:
         """Выполняет полный сценарий поиска организации и активности в ее карточке."""
         phrase = str(key_payload.get("phrase", ""))
         city = str(card_payload.get("city", ""))
@@ -487,11 +603,8 @@ class SearchRunnerService:
                     page.wait_for_timeout(random.randint(2500, 4200))
                     
                     if not resolution.detected or resolution.solved:
-                        self._log("simulate_search_action: нажимаю Esc 3 раза с интервалом 0.5с")
-                        for _ in range(3):
-                            page.keyboard.press("Escape")
-                            page.wait_for_timeout(500)
-                    
+                        self._dismiss_distribution_modal(page, context="simulate_search_action")
+
                     self._open_large_map(page)
                     if self._find_and_open_organization(
                         page,
@@ -521,8 +634,157 @@ class SearchRunnerService:
             self._log(f"simulate_search_action: завершено, effect={effect}.")
             return effect
         except Exception as error:
+            if self._is_browser_closed_error(error):
+                self._log(
+                    f"simulate_search_action: браузер закрыт/потерян ({error}), переоткрою без штрафа."
+                )
+                return {"effect": False, "actions": {}, "closed": True}
             self._log(f"simulate_search_action: ошибка {error}")
             return False
+
+    _DISTRIBUTION_CLOSE_SELECTORS: tuple[str, ...] = (
+        "button.DistributionSplashScreenModalCloseButtonOuter",
+        "button[aria-label='Нет, спасибо']",
+        ".DistributionButtonClose",
+        ".DistributionSplashScreenModalContent .Button_view_clear",
+    )
+
+    _PHOTO_VIEWER_CLOSE_SELECTORS: tuple[str, ...] = (
+        ".MediaViewer-ButtonClose",
+        ".MediaViewer-Close",
+        ".MediaViewer button[aria-label='Закрыть']",
+        "[class*='MediaViewer'] button[aria-label='Закрыть']",
+        "[class*='PhotoViewer'] button[aria-label='Закрыть']",
+        "[class*='MediaViewer'] [class*='ButtonClose']",
+        "[class*='MediaViewer'] [class*='Close']",
+        ".MediaViewerModal .Modal-CloseButton",
+        ".PhotosModal-CloseButton",
+        ".Gallery-CloseButton",
+    )
+
+    _PHOTO_OVERLAY_CLOSE_SELECTORS: tuple[str, ...] = (
+        ".OneOrgModal-CloseButton",
+        ".OneOrgTabbed_overlay .OneOrgModal-CloseButton",
+        ".Modal-Content > .OneOrgModal-CloseButton",
+    )
+
+    # Fallback: ищем кнопку закрытия строго внутри оверлея просмотрщика фото,
+    # чтобы случайно не закрыть всю карточку организации или карту.
+    _CLOSE_MEDIA_VIEWER_JS: str = """
+        () => {
+            const viewers = Array.from(
+                document.querySelectorAll('[class*="MediaViewer"], [class*="PhotoViewer"]')
+            );
+            if (viewers.length === 0) return false;
+            const root = viewers.find(
+                (n) => !n.parentElement ||
+                    !n.parentElement.closest('[class*="MediaViewer"], [class*="PhotoViewer"]')
+            ) || viewers[0];
+            const controls = root.querySelectorAll('button, [role="button"]');
+            for (const btn of controls) {
+                const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+                const cls = (typeof btn.className === 'string' ? btn.className : '').toLowerCase();
+                const hasCloseIcon = btn.querySelector(
+                    '[class*="close" i], [class*="cross" i]'
+                );
+                if (
+                    label.includes('закр') || label.includes('close') ||
+                    cls.includes('close') || hasCloseIcon
+                ) {
+                    btn.click();
+                    return true;
+                }
+            }
+            return false;
+        }
+    """
+
+    def _dismiss_distribution_modal(self, page, context: str = "search") -> None:
+        """Закрывает промо-модалку Яндекса (в т.ч. «Установить Яндекс Браузер?»).
+
+        Сначала дожидается полной загрузки страницы, затем по возможности кликает
+        реальную кнопку закрытия «Нет, спасибо» (естественное поведение), а при её
+        отсутствии удаляет оверлей из DOM. В любом случае в конце 3 раза жмёт Esc
+        как страховку на случай других всплывающих окон, закрываемых клавишей.
+        """
+        self._wait_for_full_load(page)
+
+        if not self._close_distribution_if_present(page, context):
+            removed = self._remove_distribution_overlays(page)
+            if removed:
+                self._log(
+                    f"{context}: кнопка закрытия не найдена, удалил промо-оверлеи через JS ({removed} шт.)."
+                )
+
+        self._press_escape_safety(page, context)
+
+    def _press_escape_safety(self, page, context: str = "search") -> None:
+        """Нажимает Esc 3 раза с интервалом 0.5с как страховку от всплывающих окон."""
+        self._log(f"{context}: нажимаю Esc 3 раза с интервалом 0.5с.")
+        for _ in range(3):
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            page.wait_for_timeout(500)
+
+    @staticmethod
+    def _wait_for_full_load(page) -> None:
+        """Ожидает полной загрузки страницы перед закрытием модалок (мягко)."""
+        try:
+            page.wait_for_load_state("load", timeout=5000)
+        except Exception:
+            pass
+
+    def _close_distribution_if_present(self, page, context: str = "search") -> bool:
+        """Кликает кнопку закрытия промо-модалки, если она видима. Возвращает успех."""
+        for selector in self._DISTRIBUTION_CLOSE_SELECTORS:
+            try:
+                close_btn = page.locator(selector).first
+                if close_btn.count() > 0 and close_btn.is_visible():
+                    self._log(f"{context}: закрываю промо-модалку кнопкой '{selector}'.")
+                    close_btn.click(force=True)
+                    page.wait_for_timeout(random.randint(400, 800))
+                    return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _remove_distribution_overlays(page) -> int:
+        """Удаляет из DOM промо-блоки Distribution и возвращает их число.
+
+        Нужен для отложенного сплэша «Установить Яндекс Браузер?»
+        (`DistributionSplashScreenModalContent`): у него нет кнопки закрытия,
+        только ссылка «Да», которую жать нельзя. Поэтому такой оверлей просто
+        убирается из DOM, чтобы он не перехватывал скроллы и клики.
+        """
+        script = """
+        () => {
+            const selectors = [
+                '.DistributionSplashScreenModal',
+                '.DistributionSplashScreenModalContent',
+                '[class*="DistributionSplashScreen"]',
+                '.DistributionSplashScreenModalContent .Distribution',
+            ];
+            let removed = 0;
+            const seen = new Set();
+            for (const selector of selectors) {
+                for (const node of document.querySelectorAll(selector)) {
+                    const root = node.closest('.Modal, .Modal-Content') || node;
+                    if (seen.has(root)) continue;
+                    seen.add(root);
+                    root.remove();
+                    removed += 1;
+                }
+            }
+            return removed;
+        }
+        """
+        try:
+            return int(page.evaluate(script))
+        except Exception:
+            return 0
 
     def _open_large_map(self, page) -> None:
         """Открывает большую карту из поисковой выдачи Яндекса."""
@@ -595,21 +857,61 @@ class SearchRunnerService:
         self._log(f"simulate_search_action: найдена организация '{actual_title}'.")
         page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
         self._click_organization_card(item_locator, title_locator)
+        if not self._wait_for_organization_card_opened(page, organization):
+            self._log(
+                f"simulate_search_action: карточка '{actual_title}' не открылась после клика, пропускаю."
+            )
+            return False
         self._handle_captcha_if_present(page, wait_ms=3000, context="после открытия карточки организации")
         self._run_target_overview_activity(page, min_sleep_overview, max_sleep_overview)
         return True
 
     @staticmethod
     def _click_organization_card(item_locator, title_locator) -> None:
-        """Кликает по карточке организации через overlay или заголовок."""
-        overlay_locator = item_locator.locator(".OrgCard-Overlay").first
-        try:
-            if overlay_locator.count() > 0:
-                overlay_locator.click(force=True)
-            else:
-                title_locator.click(force=True)
-        except Exception:
-            return
+        """Кликает по карточке организации, открывая её в текущей вкладке.
+
+        Приоритет — ссылка-заголовок `.OrgCard-Title` (`target="_self"`), которая
+        открывает карточку в этой же вкладке. Оверлей `.OrgCard-Overlay` имеет
+        `target="_blank"` и может открыть организацию в новой вкладке, поэтому он
+        используется лишь как крайний фолбэк.
+        """
+        candidates = (
+            item_locator.locator(".OrgCard-Title").first,
+            title_locator,
+            item_locator.locator(".OrgCard-Overlay").first,
+        )
+        for locator in candidates:
+            try:
+                if locator.count() > 0:
+                    locator.click(force=True)
+                    return
+            except Exception:
+                continue
+
+    def _wait_for_organization_card_opened(self, page, organization: str) -> bool:
+        """Подтверждает, что открылась карточка ИМЕННО нужной организации.
+
+        В модалке карты выбранная организация показывается в панели
+        `.CompaniesModal-OneOrg` с заголовком `.OrgHeader-Title`. Ждём появления
+        этого заголовка и совпадения его текста с целью, чтобы не засчитать
+        чужую авто-открытую карточку и не уйти в скроллы по списку/выдаче.
+        """
+        needle = organization.strip().lower()
+        header = page.locator(".OrgHeader-Title").first
+        deadline_ms = 8000
+        step_ms = 500
+        waited = 0
+        while waited <= deadline_ms:
+            try:
+                if header.count() > 0 and header.is_visible():
+                    title = header.inner_text().strip().lower()
+                    if not needle or needle in title:
+                        return True
+            except Exception:
+                pass
+            page.wait_for_timeout(step_ms)
+            waited += step_ms
+        return False
 
     @staticmethod
     def _scroll_organization_list(page, items, count: int) -> int:
@@ -693,6 +995,9 @@ class SearchRunnerService:
 
         sleep_time_sec = random.randint(min_sleep_overview, max_sleep_overview)
         self._log(f"simulate_search_action: имитация активности в карточке {sleep_time_sec} сек.")
+        # Внутри модалки карты НЕ жмём Esc и не трогаем общие кнопки закрытия —
+        # это закрыло бы саму карту. Гасим только промо-сплэш по спец-селекторам.
+        self._close_distribution_if_present(page, context="overview")
         end_time = page.evaluate("Date.now()") + (sleep_time_sec * 1000)
         visited_sections: set[str] = set()
         actions = {
@@ -703,6 +1008,7 @@ class SearchRunnerService:
         }
 
         while page.evaluate("Date.now()") < end_time:
+            self._close_distribution_if_present(page, context="overview")
             self._scroll_visible_content(
                 page,
                 random.randint(200, 500) * random.choice([1, 1, -1]),
@@ -732,67 +1038,121 @@ class SearchRunnerService:
         page.wait_for_timeout(random.randint(1500, 4000))
 
     def _browse_photo_section(self, page, visited_sections: set[str]) -> None:
-        """Открывает фото, листает галерею и иногда рассматривает отдельные изображения."""
+        """Открывает блок фото, рассматривает отдельные снимки и закрывает блок."""
         try:
-            photo_btn = page.locator(".PhotoTiles-More button, .OrgGallery-PhotoTiles .PhotoTiles-Item").first
-            if photo_btn.count() == 0:
+            # Плитка/кнопка в карточке, открывающая блок «Фото и видео».
+            opener = page.locator(
+                ".PhotoTiles-More button, .OrgGallery-PhotoTiles .PhotoTiles-Item, "
+                ".OrgGallery .PhotoTiles-Item, .PhotoTiles-Item"
+            ).first
+            if opener.count() == 0:
                 return
             self._log("Заметил раздел с фотографиями, скроллю к нему...")
-            photo_btn.scroll_into_view_if_needed()
+            opener.scroll_into_view_if_needed()
             page.wait_for_timeout(random.randint(1000, 2500))
-            if not photo_btn.is_visible():
+            if not opener.is_visible():
                 return
 
             visited_sections.add("photos")
             section_start = time.time()
-            self._log("Открываю раздел фото...")
-            photo_btn.click()
+            self._log("Открываю блок с фотографиями...")
+            opener.click(force=True)
             self._handle_captcha_if_present(page, wait_ms=2000, context="после открытия раздела фото")
-            wait_time = random.randint(1000, 3000)
-            self._log(f"Смотрю открывшиеся фото ({wait_time} мс)...")
-            page.wait_for_timeout(wait_time)
+            page.wait_for_timeout(random.randint(1500, 3000))
+
             self._scroll_photo_gallery(page)
-            self._close_section(
-                page,
-                ".Gallery-CloseButton, .Modal-CloseButton, .OneOrgModal-CloseButton",
-                "фото",
-                section_start,
-            )
+            # Обязательно закрываем сам блок фото (оверлей OneOrgModal),
+            # чтобы вернуться к карточке организации.
+            self._close_photo_overlay(page, section_start)
         except Exception:
             return
 
     def _scroll_photo_gallery(self, page) -> None:
-        """Листает фотогалерею и выборочно открывает отдельные фото."""
+        """Листает сетку фото и открывает несколько РАЗНЫХ снимков в лайтбоксе."""
         scroll_steps = random.randint(3, 6)
-        self._log(f"Делаю {scroll_steps} скроллов вниз по галерее фото, рассматривая их...")
-        for _ in range(scroll_steps):
+        self._log(f"Делаю {scroll_steps} скроллов по сетке фото, рассматривая снимки...")
+        opened: set[int] = set()
+        for step in range(scroll_steps):
             self._scroll_visible_content(page, random.randint(200, 600))
             page.wait_for_timeout(random.randint(2000, 4000))
-            if random.random() < 0.4:
-                self._open_random_gallery_photo(page)
+            # Часть проходов открываем конкретное фото и закрываем лайтбокс.
+            if step == 0 or random.random() < 0.5:
+                self._open_random_gallery_photo(page, opened)
 
-    def _open_random_gallery_photo(self, page) -> None:
-        """Открывает случайную видимую фотографию и закрывает ее после просмотра."""
+    def _open_random_gallery_photo(self, page, opened: set[int] | None = None) -> None:
+        """Открывает ещё не просмотренную фотографию из сетки и закрывает лайтбокс."""
         try:
-            inner_photos = page.locator(".MediaGallery-Item, .PhotoTiles-Item, .Gallery-Item")
+            inner_photos = page.locator(
+                ".MediaGrid-Item, .MediaGridItem, .MediaGallery-Item, .Gallery-Item"
+            )
             count = inner_photos.count()
             if count <= 0:
+                self._log("Не нашёл отдельных фотографий для увеличения.")
                 return
-            idx = random.randint(0, min(count - 1, 10))
+            # Выбираем индекс, который ещё не открывали, чтобы не кликать
+            # повторно по одному и тому же снимку.
+            limit = min(count, 14)
+            candidates = [i for i in range(limit) if opened is None or i not in opened]
+            if not candidates:
+                return
+            idx = random.choice(candidates)
+            if opened is not None:
+                opened.add(idx)
             photo_to_click = inner_photos.nth(idx)
             if not photo_to_click.is_visible():
                 return
             self._log(f"Кликаю на конкретное фото №{idx + 1} для увеличения...")
-            photo_to_click.click()
+            photo_to_click.scroll_into_view_if_needed()
+            photo_to_click.click(force=True)
             self._handle_captcha_if_present(page, wait_ms=2000, context=f"после открытия фото №{idx + 1}")
             view_time = random.randint(3000, 7000)
             self._log(f"Рассматриваю увеличенное фото ({view_time} мс)...")
             page.wait_for_timeout(view_time)
-            self._log("Закрываю увеличенное фото (Escape).")
-            page.keyboard.press("Escape")
+            self._close_photo_viewer(page)
             page.wait_for_timeout(random.randint(1000, 2000))
         except Exception:
             return
+
+    def _close_photo_overlay(self, page, section_start: float) -> None:
+        """Закрывает блок «Фото и видео» (оверлей OneOrgModal) по его кнопке-крестику."""
+        for selector in self._PHOTO_OVERLAY_CLOSE_SELECTORS:
+            try:
+                close_btn = page.locator(selector).first
+                if close_btn.count() > 0 and close_btn.is_visible():
+                    self._log(f"Закрываю блок с фото кнопкой '{selector}'.")
+                    close_btn.click(force=True)
+                    page.wait_for_timeout(random.randint(1000, 2000))
+                    spent = time.time() - section_start
+                    self._log(f"Закрыл раздел фото. Время пребывания: {spent:.1f} сек.")
+                    return
+            except Exception:
+                continue
+        self._log("Кнопка закрытия блока фото не найдена, оставляю как есть.")
+
+    def _close_photo_viewer(self, page) -> None:
+        """Закрывает увеличенное фото только кнопкой лайтбокса.
+
+        Esc внутри модалки карты закрыл бы всю карточку, поэтому используем
+        исключительно специфичные для просмотрщика селекторы.
+        """
+        for selector in self._PHOTO_VIEWER_CLOSE_SELECTORS:
+            try:
+                close_btn = page.locator(selector).first
+                if close_btn.count() > 0 and close_btn.is_visible():
+                    self._log(f"Закрываю увеличенное фото кнопкой '{selector}'.")
+                    close_btn.click(force=True)
+                    return
+            except Exception:
+                continue
+        # Запасной путь: ищем кнопку закрытия прямо внутри оверлея просмотрщика
+        # (тема fiji и др.), не задевая кнопку закрытия карточки/карты.
+        try:
+            if page.evaluate(self._CLOSE_MEDIA_VIEWER_JS):
+                self._log("Закрыл увеличенное фото кнопкой внутри просмотрщика (JS).")
+                return
+        except Exception:
+            pass
+        self._log("Кнопка закрытия фото не найдена, оставляю просмотрщик как есть.")
 
     def _browse_reviews_section(self, page, visited_sections: set[str]) -> None:
         """Открывает отзывы, листает их и иногда разворачивает длинный текст."""
@@ -837,17 +1197,21 @@ class SearchRunnerService:
                 self._expand_random_review(page)
 
     def _expand_random_review(self, page) -> None:
-        """Пытается раскрыть один длинный отзыв."""
+        """Пытается раскрыть один длинный отзыв (кнопка «Читать ещё»)."""
         try:
-            expand_btns = page.locator(".Review-MoreText, .ReviewText-More, .BusinessReviews-MoreText")
+            expand_btns = page.locator(
+                ".ReviewViewer-Review .Review-Text .Cut-More [role='button'], "
+                ".Review-Text .Cut-More .Link, .Cut-More .Cut-MoreToggler, "
+                ".Review-MoreText, .ReviewText-More, .BusinessReviews-MoreText"
+            )
             count = expand_btns.count()
             if count <= 0:
                 return
             btn = expand_btns.nth(random.randint(0, count - 1))
             if not btn.is_visible():
                 return
-            self._log("Разворачиваю длинный отзыв ('Читать полностью')...")
-            btn.click()
+            self._log("Разворачиваю длинный отзыв ('Читать ещё')...")
+            btn.click(force=True)
             self._handle_captcha_if_present(page, wait_ms=2000, context="после раскрытия длинного отзыва")
             page.wait_for_timeout(random.randint(3000, 6000))
         except Exception:
@@ -955,6 +1319,11 @@ class SearchRunnerService:
             self._log("simulate_maps_action: завершено успешно.")
             return {"effect": True, "actions": action_counts}
         except Exception as error:
+            if self._is_browser_closed_error(error):
+                self._log(
+                    f"simulate_maps_action: браузер закрыт/потерян ({error}), переоткрою без штрафа."
+                )
+                return {"effect": False, "actions": {}, "closed": True}
             self._log(f"simulate_maps_action: ошибка {error}")
             return {"effect": False, "actions": {}}
 
@@ -1631,10 +2000,22 @@ class SearchRunnerService:
         return browsers_path
 
     def _close_browser_session(self, context, browser, label: str) -> None:
-        """Закрывает контекст и браузер, сохраняя понятный лог места вызова."""
+        """Безопасно закрывает контекст и браузер.
+
+        Браузер мог быть закрыт вручную, поэтому любые ошибки закрытия
+        проглатываются: они не должны прерывать прогон.
+        """
         self._log(f"{label}: закрываю контекст и браузер.")
-        context.close()
-        browser.close()
+        try:
+            if context is not None:
+                context.close()
+        except Exception as error:
+            self._log(f"{label}: контекст уже закрыт или ошибка закрытия: {error}")
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception as error:
+            self._log(f"{label}: браузер уже закрыт или ошибка закрытия: {error}")
 
     def _launch_human_like_browser(self, playwright):
         """Запускает локальный Chrome или встроенный Chromium в видимом режиме."""
@@ -1867,61 +2248,73 @@ class SearchRunnerService:
 
     @staticmethod
     def _scroll_visible_content(page, delta: int) -> None:
-        """Скроллит видимый контент, избегая карты и списка организаций."""
+        """Скроллит контент именно открытой карточки организации.
+
+        Привязывается к реальному контенту карточки (галерея/фото/отзывы/блоки
+        бизнес-карточки) и скроллит его ближайший скролл-контейнер. Fallback на
+        `window` намеренно убран: иначе при не найденном контейнере скроллилась
+        поисковая страница за карточкой.
+        """
         page.evaluate(
             """
             (delta) => {
-                const isVisible = (el) => {
-                    const rect = el.getBoundingClientRect();
+                // Подстраницы «Все фото»/«Все отзывы» и сам контент карточки.
+                // Открытая карточка организации (OneOrgSimple) имеет приоритет:
+                // если она есть на экране, скроллим именно её, а не список выдачи.
+                const cardSelectors = [
+                    '.OneOrgMediaHorizontalPage', '.MediaGrid',
+                    '.ReviewViewer-ReviewList', '.ReviewViewer-Main', '.ReviewViewer',
+                    '.OneOrgSimple-Content', '.OneOrgSimple',
+                    '.CompaniesModal-OneOrg',
+                    '.ReviewsView', '.OneOrgReviews',
+                    '.BusinessReviews', '.OrgReviewsPreview',
+                    '.OrgGallery', '.PhotoTiles', '.OrgContacts',
+                    '.OrgPrices', '.OrgAbout',
+                    '.business-card-title-view', '.card-phones-view',
+                    '[class*="business-card"]', '[class*="orgpage"]',
+                    '.VerticalScroller'
+                ];
+
+                const isScrollable = (el) => {
+                    if (!(el instanceof HTMLElement)) return false;
+                    if (el.getClientRects().length === 0) return false;
                     const style = window.getComputedStyle(el);
                     return (
-                        rect.width > 0 &&
-                        rect.height > 0 &&
-                        style.visibility !== 'hidden' &&
-                        style.display !== 'none'
+                        el.scrollHeight > el.clientHeight + 20 &&
+                        ['auto', 'scroll', 'overlay'].includes(style.overflowY)
                     );
                 };
 
-                const isMapRelated = (el) => {
-                    const marker = `${el.className || ''} ${el.id || ''}`.toLowerCase();
-                    return (
-                        marker.includes('ymaps') ||
-                        marker.includes('map-container') ||
-                        marker.includes('map-pane')
-                    );
+                const scrollFrom = (anchor) => {
+                    let node = anchor;
+                    while (node && node !== document.body) {
+                        if (isScrollable(node)) { node.scrollTop += delta; return true; }
+                        node = node.parentElement;
+                    }
+                    const inner = Array.from(anchor.querySelectorAll('*'))
+                        .filter(isScrollable)
+                        .sort((a, b) => b.clientHeight - a.clientHeight)[0];
+                    if (inner) { inner.scrollTop += delta; return true; }
+                    return false;
                 };
 
-                const isOrgListRelated = (el) => {
-                    const marker = `${el.className || ''} ${el.id || ''}`.toLowerCase();
-                    return (
-                        marker.includes('verticalorgsscroller') ||
-                        marker.includes('orgcard') ||
-                        marker.includes('orgmncolumn')
-                    );
-                };
-
-                const candidates = Array.from(document.querySelectorAll('body *'))
-                    .filter((el) => el instanceof HTMLElement)
-                    .filter((el) => isVisible(el))
-                    .filter((el) => !isMapRelated(el))
-                    .filter((el) => !isOrgListRelated(el))
-                    .filter((el) => !el.closest('[class*="ymaps"], [id*="ymaps"]'))
-                    .filter((el) => !el.closest('[class*="VerticalOrgsScroller"], [class*="OrgCard"], [class*="OrgmnColumn"]'))
-                    .filter((el) => {
-                        const style = window.getComputedStyle(el);
-                        const overflowY = style.overflowY;
-                        const scrollable = el.scrollHeight > el.clientHeight + 20;
-                        return scrollable && ['auto', 'scroll', 'overlay'].includes(overflowY);
-                    })
-                    .sort((a, b) => b.clientHeight - a.clientHeight);
-
-                const target = candidates[0];
-                if (target) {
-                    target.scrollTop += delta;
-                    return;
+                // 1) Привязка к конкретному контенту карточки/подстраницы.
+                for (const selector of cardSelectors) {
+                    const el = document.querySelector(selector);
+                    if (el && scrollFrom(el)) return true;
                 }
 
-                window.scrollBy(0, delta);
+                // 2) Fallback: крупнейший скролл-контейнер внутри модалки карты,
+                //    чтобы листались открытые «Все фото»/«Все отзывы».
+                const scope = document.querySelector(
+                    '[class*="ModalWithMap"], [class*="CompaniesModal"], ' +
+                    '[class*="Modal"], [role="dialog"]'
+                ) || document;
+                const candidate = Array.from(scope.querySelectorAll('*'))
+                    .filter(isScrollable)
+                    .sort((a, b) => b.clientHeight - a.clientHeight)[0];
+                if (candidate) { candidate.scrollTop += delta; return true; }
+                return false;
             }
             """,
             delta,
@@ -2010,4 +2403,9 @@ class SearchRunnerService:
     @staticmethod
     def _log(message: str) -> None:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] [SearchRunnerService] {message}", flush=True)
+        line = f"[{now}] [SearchRunnerService] {message}"
+        print(line, flush=True)
+        try:
+            _get_run_logger().info(line)
+        except Exception:
+            pass

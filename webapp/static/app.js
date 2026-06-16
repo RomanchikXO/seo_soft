@@ -172,8 +172,11 @@ const ui = {
   globalSettingsModal: document.getElementById("globalSettingsModal"),
   captchaServiceManual: document.getElementById("captchaServiceManual"),
   captchaServiceCapsola: document.getElementById("captchaServiceCapsola"),
+  captchaServiceBotlab: document.getElementById("captchaServiceBotlab"),
   capsolaSettingsArea: document.getElementById("capsolaSettingsArea"),
   capsolaTokenInput: document.getElementById("capsolaTokenInput"),
+  botlabSettingsArea: document.getElementById("botlabSettingsArea"),
+  botlabTokenInput: document.getElementById("botlabTokenInput"),
   telegramTokenInput: document.getElementById("telegramTokenInput"),
   telegramChatIdInput: document.getElementById("telegramChatIdInput"),
   telegramProxyInput: document.getElementById("telegramProxyInput"),
@@ -859,12 +862,14 @@ async function openGlobalSettingsModal() {
     const service = settings.captcha_service || "manual";
     if (service === "capsola") {
       ui.captchaServiceCapsola.checked = true;
-      ui.capsolaSettingsArea.classList.remove("hidden");
+    } else if (service === "botlab") {
+      ui.captchaServiceBotlab.checked = true;
     } else {
       ui.captchaServiceManual.checked = true;
-      ui.capsolaSettingsArea.classList.add("hidden");
     }
     ui.capsolaTokenInput.value = settings.capsola_token || "";
+    ui.botlabTokenInput.value = settings.botlab_token || "";
+    handleCaptchaServiceChange();
     ui.telegramTokenInput.value = settings.telegram_token || "";
     ui.telegramChatIdInput.value = settings.telegram_chat_id || "";
     ui.telegramProxyInput.value = settings.telegram_proxy || "";
@@ -874,8 +879,14 @@ async function openGlobalSettingsModal() {
 }
 
 async function saveGlobalSettings() {
-  const service = ui.captchaServiceCapsola.checked ? "capsola" : "manual";
+  let service = "manual";
+  if (ui.captchaServiceCapsola.checked) {
+    service = "capsola";
+  } else if (ui.captchaServiceBotlab.checked) {
+    service = "botlab";
+  }
   const token = ui.capsolaTokenInput.value.trim();
+  const botlabToken = ui.botlabTokenInput.value.trim();
   const telegramProxy = ui.telegramProxyInput.value.trim();
   if (telegramProxy && !TELEGRAM_PROXY_PATTERN.test(telegramProxy)) {
     alert(
@@ -889,6 +900,7 @@ async function saveGlobalSettings() {
       body: JSON.stringify({
         captcha_service: service,
         capsola_token: token,
+        botlab_token: botlabToken,
         telegram_token: ui.telegramTokenInput.value.trim(),
         telegram_chat_id: ui.telegramChatIdInput.value.trim(),
         telegram_proxy: telegramProxy,
@@ -901,15 +913,13 @@ async function saveGlobalSettings() {
 }
 
 function handleCaptchaServiceChange() {
-  if (ui.captchaServiceCapsola.checked) {
-    ui.capsolaSettingsArea.classList.remove("hidden");
-  } else {
-    ui.capsolaSettingsArea.classList.add("hidden");
-  }
+  ui.capsolaSettingsArea.classList.toggle("hidden", !ui.captchaServiceCapsola.checked);
+  ui.botlabSettingsArea.classList.toggle("hidden", !ui.captchaServiceBotlab.checked);
 }
 
 ui.captchaServiceManual.onchange = handleCaptchaServiceChange;
 ui.captchaServiceCapsola.onchange = handleCaptchaServiceChange;
+ui.captchaServiceBotlab.onchange = handleCaptchaServiceChange;
 ui.openGlobalSettingsBtn.onclick = openGlobalSettingsModal;
 ui.closeGlobalSettingsBtn.onclick = () => ui.globalSettingsModal.classList.add("hidden");
 ui.saveGlobalSettingsBtn.onclick = saveGlobalSettings;
