@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -20,7 +21,7 @@ class StubSearchRunner:
         self.calls.append((captured, city, street))
         return len(captured)
 
-    def run_cards_optimization(self, cards: list[dict], threads: int) -> dict:
+    def run_cards_optimization(self, cards: list[dict], threads: int, **kwargs) -> dict:
         self.optimization_calls.append((cards, threads))
         return {
             "processed_cards": len(cards),
@@ -212,7 +213,21 @@ def test_api_optimization_run_uses_selected_cards_and_flags(tmp_path: Path) -> N
             json={"card_ids": [card_a_id, card_b_id], "threads": 5},
         )
         assert response.status_code == 200
-        assert response.json()["processed_cards"] == 2
+        run_id = response.json()["run_id"]
+        assert run_id
+
+        status = None
+        for _ in range(50):
+            status_response = client.get(f"/api/optimization/status/{run_id}")
+            assert status_response.status_code == 200
+            status = status_response.json()
+            if status["status"] in {"done", "error"}:
+                break
+            time.sleep(0.01)
+
+        assert status is not None
+        assert status["status"] == "done"
+        assert status["summary"]["processed_cards"] == 2
         assert len(stub_runner.optimization_calls) == 1
         cards_payload, threads_value = stub_runner.optimization_calls[0]
         assert threads_value == 5

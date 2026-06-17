@@ -164,7 +164,6 @@ def test_capsola_wait_for_result_handles_processing_then_ready() -> None:
     request = FakeRequestContext(
         post_response=None,
     )
-    # Capsola опрашивает через POST, поэтому переопределяем поведение под последовательность.
     responses = [
         FakeResponse({"status": "processing"}),
         FakeResponse({"status": "ready", "solution": "coordinates:x=3,y=4"}),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import datetime
 import logging
+import random
 import re
 from dataclasses import dataclass
 from typing import Callable
@@ -149,14 +150,19 @@ class ImageCoordinateCaptchaSolver:
             # force=True обязателен: контейнер силуэт-капчи (.AdvancedCaptcha-ImageWrapper)
             # перехватывает события указателя, из-за чего обычный клик зависает на 30с.
             main_img_loc.click(position={"x": target_x, "y": target_y}, force=True)
-            page.wait_for_timeout(500)
+            self._pause_between_captcha_clicks(page)
         return True
+
+    def _pause_between_captcha_clicks(self, page) -> None:
+        """Случайная пауза между кликами по капче, имитирует человека."""
+        page.wait_for_timeout(random.randint(300, 1200))
 
     def _submit(self, page) -> None:
         """Нажимает кнопку подтверждения капчи (если она присутствует)."""
         submit_btn = page.locator(self.SUBMIT_SELECTOR).first
         if submit_btn.is_visible():
             self._log("Нажатие кнопки подтверждения капчи...")
+            self._pause_between_captcha_clicks(page)
             submit_btn.click()
         else:
             self._log("Кнопка подтверждения не найдена, возможно подтверждение автоматическое.")

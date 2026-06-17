@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import os
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,6 +16,11 @@ from shagteampro.application.services.card_service import CardService
 from shagteampro.application.services.import_service import ImportService
 from shagteampro.application.services.key_service import KeyService
 from shagteampro.application.services.notification_service import NotificationService
+from shagteampro.application.services.optimization_progress import (
+    create_run,
+    finish_run,
+    get_run_snapshot,
+)
 from shagteampro.application.services.search_runner_service import SearchRunnerService
 from shagteampro.application.services.settings_service import SettingsService
 from shagteampro.application.services.yandex_organization_service import YandexOrganizationService
@@ -183,6 +189,85 @@ def build_services(database_path: Path | None = None) -> AppServices:
         yandex_organization_service=YandexOrganizationService(parser=YandexOrganizationParser()),
         notification_service=NotificationService(settings_service=settings_service),
     )
+
+
+def _build_optimization_cards_payload(
+    resolved_services: AppServices,
+    card_ids: list[int],
+) -> list[dict[str, object]]:
+    all_cards = {card.id: card for card in resolved_services.card_service.list_cards()}
+    unique_card_ids = list(dict.fromkeys(card_ids))
+    cards_payload: list[dict[str, object]] = []
+    for card_id in unique_card_ids:
+        card = all_cards.get(card_id)
+        if card is None:
+            continue
+        card_settings = _coerce_card_settings(resolved_services.settings_service.load_card_settings(card_id))
+        keys = resolved_services.key_service.list_for_card(card_id)
+        cards_payload.append(
+            {
+                "card_id": card.id,
+                "card_name": card.name,
+                "search_target": card_settings.get("search_transitions", 0),
+                "maps_target": card_settings.get("maps_transitions", 0),
+                "city": card_settings.get("city", ""),
+                "street": card_settings.get("street", ""),
+                "organization": card_settings.get("organization", ""),
+                "coordinates": card_settings.get("coordinates", ""),
+                "map_zoom_clicks": card_settings.get("map_zoom_clicks", 0),
+                "competitor_open_chance_percent": card_settings.get("competitor_open_chance_percent", 0),
+                "max_open_competitor_cards": card_settings.get("max_open_competitor_cards", 0),
+                "min_sleep_competitor_card_sec": card_settings.get("min_sleep_competitor_card_sec", 0),
+                "max_sleep_competitor_card_sec": card_settings.get("max_sleep_competitor_card_sec", 0),
+                "min_sleep_target_overview_sec": card_settings.get("min_sleep_target_overview_sec", 0),
+                "max_sleep_target_overview_sec": card_settings.get("max_sleep_target_overview_sec", 0),
+                "min_sleep_target_tab_sec": card_settings.get("min_sleep_target_tab_sec", 0),
+                "max_sleep_target_tab_sec": card_settings.get("max_sleep_target_tab_sec", 0),
+                "click_show_phone": card_settings.get("click_show_phone", 0),
+                "click_website": card_settings.get("click_website", 0),
+                "click_route": card_settings.get("click_route", 0),
+                "click_messengers": card_settings.get("click_messengers", 0),
+                "click_book_story": card_settings.get("click_book_story", 0),
+                "keys": [
+                    {
+                        "id": key.id,
+                        "phrase": key.phrase,
+                        "search_enabled": key.search_enabled,
+                        "maps_enabled": key.maps_enabled,
+                    }
+                    for key in keys
+                ],
+            }
+        )
+    return cards_payload
+
+
+def _run_optimization_worker(
+    resolved_services: AppServices,
+    cards_payload: list[dict[str, object]],
+    threads: int,
+    run_id: str,
+) -> None:
+    started_at = datetime.datetime.now()
+    try:
+        summary = resolved_services.search_runner_service.run_cards_optimization(
+            cards_payload,
+            threads,
+            progress_run_id=run_id,
+        )
+        finished_at = datetime.datetime.now()
+        summary["started_at"] = started_at.isoformat()
+        summary["finished_at"] = finished_at.isoformat()
+        summary["duration_seconds"] = (finished_at - started_at).total_seconds()
+        finish_run(run_id, summary=summary)
+
+        if resolved_services.notification_service is not None:
+            try:
+                resolved_services.notification_service.notify_optimization_finished(summary)
+            except Exception:
+                pass
+    except Exception as error:
+        finish_run(run_id, error=str(error))
 
 
 def create_app(base_dir: Path | None = None, services: AppServices | None = None) -> FastAPI:
@@ -365,67 +450,23 @@ def create_app(base_dir: Path | None = None, services: AppServices | None = None
         if payload.threads <= 0:
             raise HTTPException(status_code=400, detail="Количество потоков должно быть больше 0.")
 
-        all_cards = {card.id: card for card in resolved_services.card_service.list_cards()}
-        unique_card_ids = list(dict.fromkeys(payload.card_ids))
-        cards_payload: list[dict[str, object]] = []
-        for card_id in unique_card_ids:
-            card = all_cards.get(card_id)
-            if card is None:
-                continue
-            card_settings = _coerce_card_settings(resolved_services.settings_service.load_card_settings(card_id))
-            keys = resolved_services.key_service.list_for_card(card_id)
-            cards_payload.append(
-                {
-                    "card_id": card.id,
-                    "card_name": card.name,
-                    "search_target": card_settings.get("search_transitions", 0),
-                    "maps_target": card_settings.get("maps_transitions", 0),
-                    "city": card_settings.get("city", ""),
-                    "street": card_settings.get("street", ""),
-                    "organization": card_settings.get("organization", ""),
-                    "coordinates": card_settings.get("coordinates", ""),
-                    "map_zoom_clicks": card_settings.get("map_zoom_clicks", 0),
-                    "competitor_open_chance_percent": card_settings.get("competitor_open_chance_percent", 0),
-                    "max_open_competitor_cards": card_settings.get("max_open_competitor_cards", 0),
-                    "min_sleep_competitor_card_sec": card_settings.get("min_sleep_competitor_card_sec", 0),
-                    "max_sleep_competitor_card_sec": card_settings.get("max_sleep_competitor_card_sec", 0),
-                    "min_sleep_target_overview_sec": card_settings.get("min_sleep_target_overview_sec", 0),
-                    "max_sleep_target_overview_sec": card_settings.get("max_sleep_target_overview_sec", 0),
-                    "min_sleep_target_tab_sec": card_settings.get("min_sleep_target_tab_sec", 0),
-                    "max_sleep_target_tab_sec": card_settings.get("max_sleep_target_tab_sec", 0),
-                    "click_show_phone": card_settings.get("click_show_phone", 0),
-                    "click_website": card_settings.get("click_website", 0),
-                    "click_route": card_settings.get("click_route", 0),
-                    "click_messengers": card_settings.get("click_messengers", 0),
-                    "click_book_story": card_settings.get("click_book_story", 0),
-                    "keys": [
-                        {
-                            "id": key.id,
-                            "phrase": key.phrase,
-                            "search_enabled": key.search_enabled,
-                            "maps_enabled": key.maps_enabled,
-                        }
-                        for key in keys
-                    ],
-                }
-            )
-
-        started_at = datetime.datetime.now()
-        summary = resolved_services.search_runner_service.run_cards_optimization(
-            cards_payload, payload.threads
+        cards_payload = _build_optimization_cards_payload(resolved_services, payload.card_ids)
+        run_id = create_run(payload.threads, cards_payload)
+        worker = threading.Thread(
+            target=_run_optimization_worker,
+            args=(resolved_services, cards_payload, payload.threads, run_id),
+            name=f"optimization-{run_id[:8]}",
+            daemon=True,
         )
-        finished_at = datetime.datetime.now()
-        summary["started_at"] = started_at.isoformat()
-        summary["finished_at"] = finished_at.isoformat()
-        summary["duration_seconds"] = (finished_at - started_at).total_seconds()
+        worker.start()
+        return {"run_id": run_id}
 
-        if resolved_services.notification_service is not None:
-            try:
-                resolved_services.notification_service.notify_optimization_finished(summary)
-            except Exception:
-                pass
-
-        return summary
+    @app.get("/api/optimization/status/{run_id}")
+    def optimization_status(run_id: str) -> dict[str, object]:
+        snapshot = get_run_snapshot(run_id)
+        if snapshot is None:
+            raise HTTPException(status_code=404, detail="Задача оптимизации не найдена.")
+        return snapshot
 
     @app.post("/api/yandex-org/autofill")
     def yandex_org_autofill(payload: YandexOrgAutofillRequest) -> dict[str, str]:

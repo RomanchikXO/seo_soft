@@ -72,7 +72,8 @@ class YandexOrganizationParser:
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
+                ignore_default_args=["--enable-automation", "--no-sandbox"],
+                args=["--disable-dev-shm-usage"],
             )
             context = browser.new_context(locale="ru-RU")
             page = context.new_page()

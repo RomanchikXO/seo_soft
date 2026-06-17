@@ -114,6 +114,7 @@ const state = {
   tasks: [],
   taskSeq: 0,
   tasksCountdownTimer: null,
+  taskStatsPollTimer: null,
   cardDefaults: null,
 };
 
@@ -847,11 +848,201 @@ ui.optimizationSelectAllBtn.onclick = () => {
   renderCards();
   refreshOptimizationStatus();
 };
-async function executeOptimization(cardIds, threads) {
-  return api("/api/optimization/run", {
+async function executeOptimization(cardIds, threads, onProgress) {
+  const { run_id: runId } = await api("/api/optimization/run", {
     method: "POST",
     body: JSON.stringify({ card_ids: cardIds, threads }),
   });
+
+  while (true) {
+    const status = await api(`/api/optimization/status/${runId}`);
+    if (onProgress) {
+      onProgress(status, runId);
+    }
+    if (status.status === "done") {
+      return { summary: status.summary || status, runId };
+    }
+    if (status.status === "error") {
+      throw new Error(status.error || "Ошибка оптимизации");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+}
+
+function formatDurationHHMMSS(totalSeconds) {
+  const safeSeconds = Math.max(0, Math.round(Number(totalSeconds) || 0));
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  const seconds = safeSeconds % 60;
+  return [hours, minutes, seconds].map((part) => String(part).padStart(2, "0")).join(":");
+}
+
+function formatTaskStartedAt(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString("ru-RU");
+}
+
+function formatClickCounts(clicks) {
+  const source = clicks || {};
+  const values = ["tel", "site", "route", "msg", "story"].map((key) => Number(source[key] || 0));
+  return values.join("/");
+}
+
+function renderTaskStatsBlock(stats, task) {
+  const block = document.createElement("div");
+  block.className = "task-stats";
+
+  if (stats.is_scheduled_preview) {
+    const note = document.createElement("div");
+    note.className = "task-stats-note";
+    note.textContent = stats.scheduled_note || "Статистика выполнения появится после запуска задачи.";
+    block.appendChild(note);
+  } else if (task?.lastStats && !task.stats && task.status === "scheduled") {
+    const note = document.createElement("div");
+    note.className = "task-stats-note";
+    note.textContent = "Статистика последнего запуска. Следующий запуск запланирован.";
+    block.appendChild(note);
+  }
+
+  const rows = [
+    ["Дата/время старта", formatTaskStartedAt(stats.started_at)],
+    ["Кол-во потоков", String(stats.threads ?? "—")],
+    ["Всего ключевых фраз", String(stats.total_key_phrases ?? 0)],
+    ["Запланировано переходов", String(stats.total_work_units ?? "—")],
+    [
+      "Успешно выполнено переходов",
+      `${stats.total_successful ?? 0} (Поиск: ${stats.search_performed ?? 0}, Карты: ${stats.maps_performed ?? 0})`,
+    ],
+    [
+      "Неудачных попыток",
+      stats.is_scheduled_preview ? "—" : String(stats.total_failed_attempts ?? 0),
+    ],
+    [
+      "Среднее время на 1 успешный переход",
+      formatDurationHHMMSS(stats.avg_seconds_per_work_unit ?? stats.avg_seconds_per_phrase ?? 0),
+    ],
+    [
+      "Оставшееся время (примерно)",
+      stats.is_scheduled_preview ? "—" : formatDurationHHMMSS(stats.estimated_remaining_seconds ?? 0),
+    ],
+    ["Всего время в работе", stats.is_scheduled_preview ? "—" : formatDurationHHMMSS(stats.elapsed_seconds ?? 0)],
+  ];
+
+  for (const [label, value] of rows) {
+    const row = document.createElement("div");
+    row.className = "task-stats-row";
+    row.innerHTML = `<span class="task-stats-label">${label}:</span> <span class="task-stats-value">${value}</span>`;
+    block.appendChild(row);
+  }
+
+  const divider = document.createElement("div");
+  divider.className = "task-stats-divider";
+  block.appendChild(divider);
+
+  const detailsTitle = document.createElement("div");
+  detailsTitle.className = "task-stats-details-title";
+  detailsTitle.textContent = "Детально по карточкам:";
+  block.appendChild(detailsTitle);
+
+  const cards = Array.isArray(stats.cards) ? stats.cards : [];
+  if (cards.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "task-stats-card-line";
+    empty.textContent = "Нет данных по карточкам.";
+    block.appendChild(empty);
+  } else {
+    for (const card of cards) {
+      const line = document.createElement("div");
+      line.className = "task-stats-card-line";
+      line.textContent =
+        `${card.card_name}: успешно ${card.performed ?? 0}, неудач ${card.failures ?? 0}, в работе ${card.in_flight ?? 0} ` +
+        `(Поиск: ${card.search_performed ?? 0}, Карты: ${card.maps_performed ?? 0}) ` +
+        `[Клики tel/site/route/msg/story: ${formatClickCounts(card.clicks)}]`;
+      block.appendChild(line);
+    }
+  }
+
+  return block;
+}
+
+function getTaskCardLines(task) {
+  return task.cardIds.map((cardId) => {
+    const card = state.cards.find((item) => item.id === cardId);
+    const cardName = card?.name || `Карточка #${cardId}`;
+    return {
+      card_id: cardId,
+      card_name: cardName,
+      performed: 0,
+      failures: 0,
+      in_flight: 0,
+      search_performed: 0,
+      maps_performed: 0,
+      clicks: { tel: 0, site: 0, route: 0, msg: 0, story: 0 },
+    };
+  });
+}
+
+function buildScheduledTaskPreview(task) {
+  const when = task.nextAt ? new Date(task.nextAt).toLocaleString("ru-RU") : "—";
+  return {
+    is_scheduled_preview: true,
+    scheduled_note: `Задача ожидает запуска. Следующий старт: ${when}.`,
+    started_at: null,
+    threads: task.threads,
+    total_key_phrases: "—",
+    total_work_units: "—",
+    total_failed_attempts: 0,
+    search_performed: 0,
+    maps_performed: 0,
+    total_successful: 0,
+    avg_seconds_per_phrase: 0,
+    estimated_remaining_seconds: 0,
+    elapsed_seconds: 0,
+    cards: getTaskCardLines(task),
+  };
+}
+
+function getTaskDisplayStats(task) {
+  if (task.stats) return task.stats;
+  if (task.lastStats) return task.lastStats;
+  if (task.status === "scheduled") return buildScheduledTaskPreview(task);
+  return null;
+}
+
+function toggleTaskStats(taskId) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task) return;
+  task.statsExpanded = !task.statsExpanded;
+  renderTasks();
+}
+
+function ensureTaskStatsPollTimer() {
+  const hasRunningWithStats = state.tasks.some((task) => task.status === "running" && task.statsExpanded && task.runId);
+  if (hasRunningWithStats && !state.taskStatsPollTimer) {
+    state.taskStatsPollTimer = setInterval(async () => {
+      const tasksToRefresh = state.tasks.filter(
+        (task) => task.status === "running" && task.statsExpanded && task.runId
+      );
+      if (tasksToRefresh.length === 0) {
+        clearInterval(state.taskStatsPollTimer);
+        state.taskStatsPollTimer = null;
+        return;
+      }
+      for (const task of tasksToRefresh) {
+        try {
+          task.stats = await api(`/api/optimization/status/${task.runId}`);
+        } catch (_error) {
+          // ignore transient polling errors
+        }
+      }
+      renderTasks();
+    }, 1000);
+  } else if (!hasRunningWithStats && state.taskStatsPollTimer) {
+    clearInterval(state.taskStatsPollTimer);
+    state.taskStatsPollTimer = null;
+  }
 }
 
 ui.optimizationPlayBtn.onclick = scheduleTaskFromPlay;
@@ -1034,6 +1225,10 @@ function scheduleTaskFromPlay() {
     threads,
     status: "scheduled",
     resultText: "",
+    stats: null,
+    lastStats: null,
+    statsExpanded: false,
+    runId: null,
     timer: null,
     weekdays: [],
     time: "",
@@ -1084,11 +1279,59 @@ function scheduleTaskFromPlay() {
 async function runTask(task) {
   task.timer = null;
   task.status = "running";
+  task.stats = null;
+  task.statsExpanded = false;
+  task.runId = null;
   renderTasks();
   try {
-    const result = await executeOptimization(task.cardIds, task.threads);
+    const { summary: result } = await executeOptimization(task.cardIds, task.threads, (progress, runId) => {
+      task.runId = runId;
+      task.stats = progress;
+      if (task.statsExpanded) {
+        renderTasks();
+      }
+    });
     const finishedAt = new Date().toLocaleTimeString("ru-RU");
     task.status = "done";
+    task.stats = task.stats && task.stats.status === "done" ? task.stats : {
+      status: "done",
+      started_at: result.started_at,
+      threads: task.threads,
+      total_key_phrases: task.stats?.total_key_phrases ?? 0,
+      total_work_units: task.stats?.total_work_units ?? ((result.total_search_target || 0) + (result.total_maps_target || 0)),
+      search_performed: result.total_search_performed || 0,
+      maps_performed: result.total_maps_performed || 0,
+      total_successful: (result.total_search_performed || 0) + (result.total_maps_performed || 0),
+      total_failed_attempts: 0,
+      elapsed_seconds: result.duration_seconds || 0,
+      avg_seconds_per_phrase: result.duration_seconds && ((result.total_search_performed || 0) + (result.total_maps_performed || 0))
+        ? result.duration_seconds / ((result.total_search_performed || 0) + (result.total_maps_performed || 0))
+        : 0,
+      avg_seconds_per_work_unit: result.duration_seconds && ((result.total_search_performed || 0) + (result.total_maps_performed || 0))
+        ? result.duration_seconds / ((result.total_search_performed || 0) + (result.total_maps_performed || 0))
+        : 0,
+      estimated_remaining_seconds: 0,
+      cards: Array.isArray(result.cards)
+        ? result.cards.map((card) => ({
+            card_id: card.card_id,
+            card_name: card.card_name || card.organization || "Без названия",
+            performed: (card.search_performed || 0) + (card.maps_performed || 0),
+            failures:
+              Math.max(0, (card.search_target || 0) - (card.search_performed || 0)) +
+              Math.max(0, (card.maps_target || 0) - (card.maps_performed || 0)),
+            in_flight: 0,
+            search_performed: card.search_performed || 0,
+            maps_performed: card.maps_performed || 0,
+            clicks: {
+              tel: card.maps_action_counts?.["Показать телефон"] || 0,
+              site: card.maps_action_counts?.["Сайт"] || 0,
+              route: card.maps_action_counts?.["Маршрут"] || 0,
+              msg: card.maps_action_counts?.["мессенджер"] || 0,
+              story: card.maps_action_counts?.["Записаться"] || 0,
+            },
+          }))
+        : [],
+    };
     task.resultText =
       `Готово в ${finishedAt}. Карточек: ${result.processed_cards}, ` +
       `Поиск: ${result.total_search_performed}/${result.total_search_target}, ` +
@@ -1096,19 +1339,31 @@ async function runTask(task) {
   } catch (error) {
     task.status = "error";
     task.resultText = `Ошибка запуска: ${error.message}`;
+    if (task.stats) {
+      task.stats.status = "error";
+      task.stats.error = error.message;
+    }
   }
 
   if (task.type === "auto") {
     const nextAt = computeNextAutoRun(task.weekdays, task.time, Date.now());
     if (nextAt) {
+      if (task.stats) {
+        task.lastStats = task.stats;
+      }
       task.nextAt = nextAt;
       task.status = "scheduled";
+      task.stats = null;
+      task.statsExpanded = false;
+      task.runId = null;
+      task.resultText = "";
       armTask(task);
     }
   }
 
   renderTasks();
   ensureCountdownTimer();
+  ensureTaskStatsPollTimer();
 }
 
 function cancelTask(taskId) {
@@ -1141,8 +1396,11 @@ function tickCountdowns() {
 function renderTasks() {
   ui.optimizationTasksList.innerHTML = "";
   for (const task of state.tasks) {
+    const displayStats = getTaskDisplayStats(task);
     const card = document.createElement("div");
-    card.className = `task-card ${task.status}`;
+    card.className = `task-card ${task.status} task-card-clickable`;
+    card.onclick = () => toggleTaskStats(task.id);
+    card.title = task.statsExpanded ? "Скрыть статистику" : "Показать статистику";
 
     const row = document.createElement("div");
     row.className = "task-row";
@@ -1159,8 +1417,12 @@ function renderTasks() {
     cancelBtn.type = "button";
     cancelBtn.className = "btn task-cancel";
     cancelBtn.textContent = task.status === "done" || task.status === "error" ? "Убрать" : "Отменить";
-    cancelBtn.onclick = () => cancelTask(task.id);
+    cancelBtn.onclick = (event) => {
+      event.stopPropagation();
+      cancelTask(task.id);
+    };
     row.appendChild(cancelBtn);
+
     card.appendChild(row);
 
     const meta = document.createElement("div");
@@ -1171,22 +1433,36 @@ function renderTasks() {
         `Карточек: ${task.cardIds.length}, потоки: ${task.threads}. ` +
         `Следующий запуск: <b>${when}</b> · ` +
         `через <span class="task-countdown" data-task="${task.id}">${formatCountdown(task.nextAt - Date.now())}</span>`;
+      meta.innerHTML += task.statsExpanded
+        ? " Статистика развёрнута."
+        : " Нажмите, чтобы открыть статистику.";
     } else if (task.status === "running") {
       meta.textContent = `Выполняется… Карточек: ${task.cardIds.length}, потоки: ${task.threads}.`;
+      meta.textContent += task.statsExpanded
+        ? " Статистика развёрнута."
+        : " Нажмите, чтобы открыть статистику.";
     } else {
       meta.textContent = `Карточек: ${task.cardIds.length}, потоки: ${task.threads}.`;
+      meta.textContent += task.statsExpanded
+        ? " Статистика развёрнута."
+        : " Нажмите, чтобы открыть статистику.";
     }
     card.appendChild(meta);
 
-    if (task.resultText) {
+    if (task.resultText && !task.statsExpanded) {
       const result = document.createElement("div");
       result.className = "task-result";
       result.textContent = task.resultText;
       card.appendChild(result);
     }
 
+    if (task.statsExpanded && displayStats) {
+      card.appendChild(renderTaskStatsBlock(displayStats, task));
+    }
+
     ui.optimizationTasksList.appendChild(card);
   }
+  ensureTaskStatsPollTimer();
 }
 
 ui.modeRealtime.addEventListener("mousedown", () => setScheduleMode("realtime"));

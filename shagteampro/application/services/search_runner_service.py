@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import datetime
 import logging
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import uuid
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Iterable
@@ -20,6 +24,7 @@ from shagteampro.application.services.settings_service import SettingsService
 _RUN_LOG_PATH = Path.home() / ".shagteampro" / "logs" / "run.log"
 _run_logger: logging.Logger | None = None
 _run_logger_lock = threading.Lock()
+_log_worker_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("log_worker_id", default=None)
 
 
 def _get_run_logger() -> logging.Logger:
@@ -95,6 +100,13 @@ class _ActionBudget:
             return dict(self._remaining)
 
 
+_PLAYWRIGHT_ACTION_TIMEOUT_MS = 5_000
+_CHROME_IGNORED_DEFAULT_ARGS = (
+    "--enable-automation",
+    "--no-sandbox",
+)
+
+
 class SearchRunnerService:
     """Сервис, который управляет Playwright-браузером и имитирует действия пользователя."""
 
@@ -108,6 +120,9 @@ class SearchRunnerService:
     def __init__(self, captcha_service: CaptchaService | None = None, settings_service: SettingsService | None = None) -> None:
         self._settings_service = settings_service
         self._captcha_service = captcha_service or CaptchaService(logger=self._log)
+        self._browser_pid_lock = threading.Lock()
+        self._browser_launch_lock = threading.Lock()
+        self._claimed_browser_pids: set[int] = set()
 
     def _update_captcha_service(self) -> None:
         """Обновляет экземпляр CaptchaService в зависимости от глобальных настроек."""
@@ -167,44 +182,47 @@ class SearchRunnerService:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         from playwright.sync_api import sync_playwright
 
-        with sync_playwright() as playwright:
-            browser = self._launch_chromium_with_recovery(playwright, browsers_path)
-            context = self._create_human_like_context(browser)
-            page = context.new_page()
-            executed_count = 0
-            try:
-                for query in queries:
-                    # Каждый запрос изолирован: ошибка/ручное закрытие браузера на одном
-                    # запросе не должны рушить весь пакетный прогон.
-                    try:
-                        if not self._is_page_alive(page):
-                            self._log("run_yandex_searches: страница/браузер недоступны, пересоздаю сессию.")
-                            context, browser, page = self._recreate_session(
-                                playwright, browsers_path, context, browser
-                            )
+        playwright = None
+        browser = None
+        context = None
+        executed_count = 0
+        try:
+            playwright = sync_playwright().start()
+            browser, context = self._launch_chromium_with_recovery(playwright, browsers_path)
+            page = self._open_browser_page(context)
+            for query in queries:
+                # Каждый запрос изолирован: ошибка/ручное закрытие браузера на одном
+                # запросе не должны рушить весь пакетный прогон.
+                try:
+                    if not self._is_page_alive(page):
+                        self._log("run_yandex_searches: страница/браузер недоступны, пересоздаю сессию.")
+                        context, browser, page = self._recreate_session(
+                            playwright, browsers_path, context, browser
+                        )
 
-                        self._log(f"Открываю ya.ru для запроса: {query}")
-                        page.goto("https://ya.ru/", wait_until="domcontentloaded")
-                        page.wait_for_timeout(2000)
-                        search_input = self._get_search_input(page)
-                        page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
-                        self._type_query_and_submit(page, search_input, query)
-                        resolution = self._handle_captcha_if_present(page, context=f"после отправки запроса '{query}'")
-                        page.wait_for_timeout(random.randint(2500, 4200))
+                    self._log(f"Открываю ya.ru для запроса: {query}")
+                    page.goto("https://ya.ru/", wait_until="domcontentloaded")
+                    page.wait_for_timeout(2000)
+                    search_input = self._get_search_input(page)
+                    page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
+                    self._type_query_and_submit(page, search_input, query)
+                    resolution = self._handle_captcha_if_present(page, context=f"после отправки запроса '{query}'")
+                    page.wait_for_timeout(random.randint(2500, 4200))
 
-                        if not resolution.detected or resolution.solved:
-                            self._dismiss_distribution_modal(page, context="run_yandex_searches")
+                    if not resolution.detected or resolution.solved:
+                        self._dismiss_distribution_modal(page, context="run_yandex_searches")
 
-                        executed_count += 1
-                        self._log(f"Запрос обработан успешно. Выполнено: {executed_count}/{len(queries)}")
-                    except PlaywrightTimeoutError:
-                        self._log(f"Таймаут на запросе '{query}', перехожу к следующему.")
-                        continue
-                    except Exception as error:
-                        self._log(f"Ошибка на запросе '{query}': {error}. Перехожу к следующему.")
-                        continue
-            finally:
-                self._close_browser_session(context, browser, "run_yandex_searches")
+                    executed_count += 1
+                    self._log(f"Запрос обработан успешно. Выполнено: {executed_count}/{len(queries)}")
+                except PlaywrightTimeoutError:
+                    self._log(f"Таймаут на запросе '{query}', перехожу к следующему.")
+                    continue
+                except Exception as error:
+                    self._log(f"Ошибка на запросе '{query}': {error}. Перехожу к следующему.")
+                    continue
+        finally:
+            self._close_browser_session(context, browser, "run_yandex_searches")
+            self._stop_playwright_instance(playwright, "run_yandex_searches", browser=browser)
         self._log(f"Пакетный поиск завершен. Итого выполнено: {executed_count}")
         return executed_count
 
@@ -219,13 +237,20 @@ class SearchRunnerService:
     def _recreate_session(self, playwright, browsers_path: Path, old_context, old_browser):
         """Закрывает мёртвую сессию и поднимает новую (браузер/контекст/страница)."""
         self._close_browser_session(old_context, old_browser, "run_yandex_searches:recreate")
-        browser = self._launch_chromium_with_recovery(playwright, browsers_path)
-        context = self._create_human_like_context(browser)
-        page = context.new_page()
+        browser, context = self._launch_chromium_with_recovery(playwright, browsers_path)
+        page = self._open_browser_page(context)
         return context, browser, page
 
-    def run_cards_optimization(self, cards: list[dict[str, object]], threads: int) -> dict[str, object]:
+    def run_cards_optimization(
+        self,
+        cards: list[dict[str, object]],
+        threads: int,
+        *,
+        progress_run_id: str | None = None,
+    ) -> dict[str, object]:
         """Запускает оптимизацию карточек по выбранным поисковым и картографическим ключам."""
+        from shagteampro.application.services.optimization_progress import update_run_from_targets
+
         self._update_captcha_service()
         prepared_cards = [card for card in cards if card.get("card_id") is not None]
         max_workers = max(1, min(int(threads), 50))
@@ -249,7 +274,17 @@ class SearchRunnerService:
             for card_payload in prepared_cards
         }
         targets = self._build_target_states(prepared_cards)
-        self._run_targets_in_pool(targets, max_workers)
+        update_run_from_targets(
+            progress_run_id,
+            targets=targets,
+            card_results=card_results,
+        )
+        self._run_targets_in_pool(
+            targets,
+            max_workers,
+            card_results=card_results,
+            progress_run_id=progress_run_id,
+        )
         for state in targets:
             self._apply_target_state(card_results[state["card_id"]], state)
 
@@ -333,17 +368,44 @@ class SearchRunnerService:
         }
         return _ActionBudget(limits)
 
-    def _run_targets_in_pool(self, targets: list[dict[str, object]], max_workers: int) -> None:
+    def _run_targets_in_pool(
+        self,
+        targets: list[dict[str, object]],
+        max_workers: int,
+        *,
+        card_results: dict[int, dict[str, object]] | None = None,
+        progress_run_id: str | None = None,
+    ) -> None:
         """Выполняет все цели в одном общем пуле, держа до max_workers действий одновременно.
 
         Единица параллелизма — это одно действие по одному ключу. Планировщик в главном
         потоке наполняет пул, поэтому при N потоках одновременно открывается до N браузеров,
         даже если все действия идут по одной фразе/ключу.
         """
+        from shagteampro.application.services.optimization_progress import update_run_from_targets
+
         if not targets:
             return
 
         future_meta: dict[concurrent.futures.Future, tuple[dict[str, object], dict[str, object]]] = {}
+
+        def report_progress(
+            key_payload: dict[str, object] | None = None,
+            state: dict[str, object] | None = None,
+            *,
+            action_completed: bool = False,
+        ) -> None:
+            if card_results is None:
+                return
+            if state is not None:
+                card_id = int(state["card_id"])
+                self._apply_target_state(card_results[card_id], state)
+            update_run_from_targets(
+                progress_run_id,
+                targets=targets,
+                card_results=card_results,
+                action_completed=action_completed,
+            )
 
         def fill(executor: concurrent.futures.Executor) -> None:
             while len(future_meta) < max_workers:
@@ -352,8 +414,15 @@ class SearchRunnerService:
                     break
                 key_payload = random.choice(state["active_keys"])
                 state["in_flight"] += 1
-                future = executor.submit(self._execute_single_action, state, key_payload)
-                future_meta[future] = (state, key_payload)
+                worker_id = uuid.uuid4().hex
+                future = executor.submit(self._execute_single_action, state, key_payload, worker_id)
+                future_meta[future] = (state, key_payload, worker_id)
+                self._log(
+                    f"Пул: запущено действие {state['mode']} для карточки #{state['card_id']} "
+                    f"(in_flight={state['in_flight']}, performed={state['performed']}/{state['target']}).",
+                    worker_id=worker_id,
+                )
+                report_progress(state=state)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             fill(executor)
@@ -362,8 +431,14 @@ class SearchRunnerService:
                     future_meta.keys(), return_when=concurrent.futures.FIRST_COMPLETED
                 )
                 for future in done:
-                    state, key_payload = future_meta.pop(future)
+                    state, key_payload, worker_id = future_meta.pop(future)
                     self._consume_action_result(state, key_payload, future)
+                    self._log(
+                        f"Пул: действие {state['mode']} для карточки #{state['card_id']} завершено "
+                        f"(performed={state['performed']}/{state['target']}, in_flight={state['in_flight']}).",
+                        worker_id=worker_id,
+                    )
+                    report_progress(key_payload, state, action_completed=True)
                 fill(executor)
 
         for state in targets:
@@ -417,24 +492,30 @@ class SearchRunnerService:
                 )
         elif result.get("closed"):
             self._log(
-                f"Карточка #{state['card_id']}: {state['mode']} — браузер закрыт вручную или потерян, "
-                f"переоткрываю без штрафа."
+                f"Карточка #{state['card_id']}: {state['mode']} — браузер закрыт вручную, "
+                f"сразу запущу новый поток без штрафа."
             )
-        else:
+        elif result.get("count_failure"):
             self._handle_failed_action(state, key_payload)
+        else:
+            self._log(
+                f"Карточка #{state['card_id']}: {state['mode']} — переход без результата "
+                f"(транзитная ошибка), повторю без увеличения счётчика неудач."
+            )
 
     def _handle_failed_action(
         self,
         state: dict[str, object],
         key_payload: dict[str, object],
     ) -> None:
-        """Обрабатывает неуспешный переход: переключает ключ или повторяет попытку.
+        """Обрабатывает провал: организация не найдена в списке после открытия карты/выдачи.
 
         Если у цели есть другие ключи, текущий считается непродуктивным и
-        убирается. Если ключ единственный, провал трактуется как транзитный
-        (не открылась карта/капча) и попытка повторяется до исчерпания бюджета
-        в `target` неудач — это защищает от зацикливания, но не обнуляет цель
-        после первой же ошибки.
+        убирается. Если ключ единственный, попытка повторяется до исчерпания
+        бюджета в `target` неудач — это защищает от зацикливания, но не обнуляет
+        цель после первой же ошибки.
+
+        Транзитные сбои (капча, пустая выдача, таймаут и т.п.) сюда не попадают.
         """
         state["failures"] += 1
         card_id = state["card_id"]
@@ -458,32 +539,40 @@ class SearchRunnerService:
         )
 
     def _execute_single_action(
-        self, state: dict[str, object], key_payload: dict[str, object]
+        self,
+        state: dict[str, object],
+        key_payload: dict[str, object],
+        worker_id: str,
     ) -> dict[str, object]:
         """Выполняет одно действие по ключу в зависимости от режима цели."""
-        if state["mode"] == "search":
+        token = _log_worker_id.set(worker_id)
+        try:
+            if state["mode"] == "search":
+                return self._normalize_action_result(
+                    self._simulate_search_action(key_payload, state["card_payload"])
+                )
             return self._normalize_action_result(
-                self._simulate_search_action(key_payload, state["card_payload"])
+                self._simulate_browser_action_one_second(
+                    key_payload,
+                    state["card_payload"],
+                    action_budget=state.get("action_budget"),
+                )
             )
-        return self._normalize_action_result(
-            self._simulate_browser_action_one_second(
-                key_payload,
-                state["card_payload"],
-                action_budget=state.get("action_budget"),
-            )
-        )
+        finally:
+            _log_worker_id.reset(token)
 
     @staticmethod
     def _normalize_action_result(raw: object) -> dict[str, object]:
-        """Приводит результат действия к виду {'effect': bool, 'actions': dict, 'closed': bool}."""
+        """Приводит результат действия к единому виду для планировщика."""
         if isinstance(raw, dict):
             actions = raw.get("actions") or {}
             return {
                 "effect": bool(raw.get("effect")),
                 "actions": dict(actions) if isinstance(actions, dict) else {},
                 "closed": bool(raw.get("closed")),
+                "count_failure": bool(raw.get("count_failure")),
             }
-        return {"effect": bool(raw), "actions": {}, "closed": False}
+        return {"effect": bool(raw), "actions": {}, "closed": False, "count_failure": False}
 
     _BROWSER_CLOSED_MARKERS: tuple[str, ...] = (
         "has been closed",
@@ -522,10 +611,8 @@ class SearchRunnerService:
         card_entry[f"{mode}_performed"] = int(state["performed"])
         card_entry[f"{mode}_effect_keys"] = sorted(state["effect_key_ids"])
         if mode == "maps":
-            merged: dict[str, int] = dict(card_entry.get("maps_action_counts", {}))
-            for action_label, count in state.get("action_counts", {}).items():
-                merged[action_label] = merged.get(action_label, 0) + int(count)
-            card_entry["maps_action_counts"] = merged
+            # state["action_counts"] уже накопительный итог по цели maps — не суммируем повторно.
+            card_entry["maps_action_counts"] = dict(state.get("action_counts", {}))
 
     def _build_optimization_summary(self, card_results: dict[int, dict[str, object]]) -> dict[str, object]:
         """Собирает итоговый ответ оптимизации по всем карточкам."""
@@ -583,38 +670,70 @@ class SearchRunnerService:
         self._log(f"simulate_search_action: старт для запроса '{query}'.")
 
         browsers_path = self._prepare_runtime_browsers_path()
+        label = "simulate_search_action"
+        playwright = None
+        browser = None
+        context = None
+        effect = False
+        force_fast_close = False
+        browser_closed_externally = False
+        reached_org_list = False
+        step_label = "init"
         try:
-            from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.sync_api import sync_playwright
+        except Exception as error:
+            self._log(f"{label}: не удалось импортировать Playwright: {error}")
+            return False
 
-            with sync_playwright() as playwright:
-                self._log("simulate_search_action: запускаю браузер и контекст.")
-                browser = self._launch_chromium_with_recovery(playwright, browsers_path)
-                context = self._create_human_like_context(browser)
-                page = context.new_page()
-                effect = False
-                try:
-                    self._log("simulate_search_action: перехожу на ya.ru.")
-                    page.goto("https://ya.ru/", wait_until="domcontentloaded")
-                    page.wait_for_timeout(2000)
-                    search_input = self._get_search_input(page)
-                    page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
-                    self._type_query_and_submit(page, search_input, query)
-                    resolution = self._handle_captcha_if_present(page, context=f"после отправки запроса '{query}'")
-                    page.wait_for_timeout(random.randint(2500, 4200))
-                    
-                    if not resolution.detected or resolution.solved:
-                        self._dismiss_distribution_modal(page, context="simulate_search_action")
+        try:
+            step_label = "запуск браузера"
+            playwright = sync_playwright().start()
+            self._log(f"{label}: запускаю браузер и контекст.")
+            browser, context = self._launch_chromium_with_recovery(playwright, browsers_path)
+            page = self._open_browser_page(context)
+            step_label = "ya.ru"
+            self._log(f"{label}: перехожу на ya.ru.")
+            page.goto("https://ya.ru/", wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+            search_input = self._get_search_input(page)
+            page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
+            step_label = "отправка запроса"
+            self._type_query_and_submit(page, search_input, query)
+            resolution = self._handle_captcha_if_present(page, context=f"после отправки запроса '{query}'")
+            if self._captcha_blocks_progress(resolution):
+                self._log(
+                    f"{label}: капча не решена после отправки запроса, "
+                    "завершаю поток досрочно — слот пула освободится для следующей попытки."
+                )
+                force_fast_close = True
+                return False
+            page.wait_for_timeout(random.randint(2500, 4200))
 
-                    self._open_large_map(page)
-                    if self._find_and_open_organization(
-                        page,
-                        organization,
-                        min_sleep_overview,
-                        max_sleep_overview,
-                    ):
-                        effect = True
-                        self._log("simulate_search_action: результат достигнут до зума карты.")
-                    elif self._run_zoom_search(
+            if not resolution.detected or resolution.solved:
+                self._dismiss_distribution_modal(page, context=label)
+
+            step_label = "открытие большой карты"
+            if not self._open_large_map(page):
+                self._log(
+                    f"{label}: на выдаче нет блока организаций/карты, "
+                    "завершаю без поиска — слот пула освободится сразу."
+                )
+                force_fast_close = True
+            else:
+                reached_org_list = True
+                step_label = "поиск организации в списке"
+                if self._find_and_open_organization(
+                    page,
+                    organization,
+                    min_sleep_overview,
+                    max_sleep_overview,
+                ):
+                    effect = True
+                    self._log(f"{label}: результат достигнут до зума карты.")
+                else:
+                    step_label = "zoom-итерации"
+                    if self._run_zoom_search(
                         page,
                         organization,
                         map_zoom_clicks,
@@ -624,27 +743,56 @@ class SearchRunnerService:
                     ):
                         effect = True
                     else:
-                        self._log("simulate_search_action: организация не найдена после всех zoom-итераций.")
-
-                except PlaywrightTimeoutError:
-                    self._log("simulate_search_action: таймаут Playwright.")
-                    pass
-                finally:
-                    self._close_browser_session(context, browser, "simulate_search_action")
-            self._log(f"simulate_search_action: завершено, effect={effect}.")
-            return effect
+                        self._log(f"{label}: организация не найдена после всех zoom-итераций.")
+        except PlaywrightTimeoutError:
+            force_fast_close = True
+            self._log(
+                f"{label}: таймаут Playwright на шаге «{step_label}» "
+                f"(лимит действия {_PLAYWRIGHT_ACTION_TIMEOUT_MS} мс)."
+            )
         except Exception as error:
             if self._is_browser_closed_error(error):
+                force_fast_close = True
+                browser_closed_externally = True
                 self._log(
-                    f"simulate_search_action: браузер закрыт/потерян ({error}), переоткрою без штрафа."
+                    f"{label}: браузер закрыт/потерян ({error}), переоткрою без штрафа."
                 )
                 return {"effect": False, "actions": {}, "closed": True}
-            self._log(f"simulate_search_action: ошибка {error}")
+            force_fast_close = True
+            self._log(f"{label}: ошибка {error}")
             return False
+        finally:
+            self._close_browser_session(
+                context,
+                browser,
+                label,
+                force_fast=force_fast_close,
+                skip_kill=browser_closed_externally,
+            )
+            self._stop_playwright_instance(
+                playwright,
+                label,
+                browser=browser,
+                force_fast=force_fast_close,
+                skip_kill=browser_closed_externally,
+            )
+            self._log(f"{label}: cleanup завершён, worker освобождён.")
+        self._log(f"{label}: завершено, effect={effect}.")
+        if effect:
+            return True
+        return {
+            "effect": False,
+            "actions": {},
+            "count_failure": reached_org_list,
+        }
 
     _DISTRIBUTION_CLOSE_SELECTORS: tuple[str, ...] = (
+        ".DistributionSplashScreenModalContent button.DistributionButtonClose",
+        ".DistributionSplashScreenModalContent button:has-text('Нет, спасибо')",
+        ".DistributionActions button.DistributionButtonClose",
         "button.DistributionSplashScreenModalCloseButtonOuter",
         "button[aria-label='Нет, спасибо']",
+        "button:has-text('Нет, спасибо')",
         ".DistributionButtonClose",
         ".DistributionSplashScreenModalContent .Button_view_clear",
     )
@@ -666,6 +814,16 @@ class SearchRunnerService:
         ".OneOrgModal-CloseButton",
         ".OneOrgTabbed_overlay .OneOrgModal-CloseButton",
         ".Modal-Content > .OneOrgModal-CloseButton",
+    )
+
+    # Вкладки карточки организации на Яндекс.Картах (класс _name_* + подпись).
+    _MAPS_CARD_TAB_SPECS: tuple[tuple[str, str], ...] = (
+        ("overview", "Обзор"),
+        ("menu", "Меню"),
+        ("posts", "Новости"),
+        ("gallery", "Фото"),
+        ("reviews", "Отзывы"),
+        ("features", "Особенности"),
     )
 
     # Fallback: ищем кнопку закрытия строго внутри оверлея просмотрщика фото,
@@ -699,15 +857,25 @@ class SearchRunnerService:
         }
     """
 
-    def _dismiss_distribution_modal(self, page, context: str = "search") -> None:
-        """Закрывает промо-модалку Яндекса (в т.ч. «Установить Яндекс Браузер?»).
+    def _dismiss_distribution_modal(
+        self,
+        page,
+        context: str = "search",
+        *,
+        wait_load: bool = True,
+        press_escape: bool = True,
+    ) -> None:
+        """Закрывает промо-модалку Яндекса (в т.ч. «Сделать Яндекс основным поиском?»).
 
-        Сначала дожидается полной загрузки страницы, затем по возможности кликает
+        Сначала по возможности дожидается полной загрузки страницы, затем кликает
         реальную кнопку закрытия «Нет, спасибо» (естественное поведение), а при её
-        отсутствии удаляет оверлей из DOM. В любом случае в конце 3 раза жмёт Esc
-        как страховку на случай других всплывающих окон, закрываемых клавишей.
+        отсутствии удаляет оверлей из DOM.
+
+        Esc жмётся только если `press_escape=True`. На открытой карте/карте организации
+        Esc закрывает саму карту — там его использовать нельзя.
         """
-        self._wait_for_full_load(page)
+        if wait_load:
+            self._wait_for_full_load(page)
 
         if not self._close_distribution_if_present(page, context):
             removed = self._remove_distribution_overlays(page)
@@ -716,7 +884,8 @@ class SearchRunnerService:
                     f"{context}: кнопка закрытия не найдена, удалил промо-оверлеи через JS ({removed} шт.)."
                 )
 
-        self._press_escape_safety(page, context)
+        if press_escape:
+            self._press_escape_safety(page, context)
 
     def _press_escape_safety(self, page, context: str = "search") -> None:
         """Нажимает Esc 3 раза с интервалом 0.5с как страховку от всплывающих окон."""
@@ -766,6 +935,8 @@ class SearchRunnerService:
                 '.DistributionSplashScreenModalContent',
                 '[class*="DistributionSplashScreen"]',
                 '.DistributionSplashScreenModalContent .Distribution',
+                '.Modal-Content:has(.DistributionSplashScreenModalContent)',
+                '.Modal:has(.DistributionTitle)',
             ];
             let removed = 0;
             const seen = new Set();
@@ -786,15 +957,29 @@ class SearchRunnerService:
         except Exception:
             return 0
 
-    def _open_large_map(self, page) -> None:
+    def _open_large_map(self, page) -> bool:
         """Открывает большую карту из поисковой выдачи Яндекса."""
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
         map_button_locator = page.locator("a.OrgmnColumn-MapButton").first
-        map_button_locator.wait_for(state="visible", timeout=5000)
+        try:
+            map_button_locator.wait_for(state="visible", timeout=_PLAYWRIGHT_ACTION_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            self._log(
+                "simulate_search_action: на странице нет блока организаций/кнопки карты "
+                "(пустая выдача или другой формат SERP)."
+            )
+            return False
         page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
-        map_button_locator.click()
+        try:
+            map_button_locator.click(timeout=_PLAYWRIGHT_ACTION_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            self._log("simulate_search_action: не удалось нажать кнопку карты.")
+            return False
         self._log("simulate_search_action: открыта большая карта.")
         self._handle_captcha_if_present(page, wait_ms=3000, context="после открытия большой карты")
         page.wait_for_timeout(random.randint(2000, 3000))
+        return True
 
     def _find_and_open_organization(
         self,
@@ -808,7 +993,10 @@ class SearchRunnerService:
             self._log("simulate_search_action: название организации пустое, поиск в списке невозможен.")
             return False
         try:
-            page.locator("ul.VerticalOrgsScroller-List").first.wait_for(state="visible", timeout=5000)
+            page.locator("ul.VerticalOrgsScroller-List").first.wait_for(
+                state="visible",
+                timeout=_PLAYWRIGHT_ACTION_TIMEOUT_MS,
+            )
         except Exception:
             return False
 
@@ -857,11 +1045,29 @@ class SearchRunnerService:
         self._log(f"simulate_search_action: найдена организация '{actual_title}'.")
         page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
         self._click_organization_card(item_locator, title_locator)
+        page.wait_for_timeout(random.randint(400, 800))
+        self._dismiss_distribution_modal(
+            page,
+            context="simulate_search_action",
+            wait_load=False,
+            press_escape=False,
+        )
         if not self._wait_for_organization_card_opened(page, organization):
             self._log(
-                f"simulate_search_action: карточка '{actual_title}' не открылась после клика, пропускаю."
+                f"simulate_search_action: карточка '{actual_title}' не открылась после клика, "
+                "повторно закрываю промо-модалку «Сделать Яндекс основным поиском?»."
             )
-            return False
+            self._dismiss_distribution_modal(
+                page,
+                context="simulate_search_action",
+                wait_load=False,
+                press_escape=False,
+            )
+            if not self._wait_for_organization_card_opened(page, organization):
+                self._log(
+                    f"simulate_search_action: карточка '{actual_title}' не открылась после клика, пропускаю."
+                )
+                return False
         self._handle_captcha_if_present(page, wait_ms=3000, context="после открытия карточки организации")
         self._run_target_overview_activity(page, min_sleep_overview, max_sleep_overview)
         return True
@@ -883,7 +1089,7 @@ class SearchRunnerService:
         for locator in candidates:
             try:
                 if locator.count() > 0:
-                    locator.click(force=True)
+                    locator.click(force=True, timeout=_PLAYWRIGHT_ACTION_TIMEOUT_MS)
                     return
             except Exception:
                 continue
@@ -916,7 +1122,7 @@ class SearchRunnerService:
     @staticmethod
     def _scroll_organization_list(page, items, count: int) -> int:
         """Прокручивает список организаций к последнему элементу и возвращает новый размер списка."""
-        items.nth(count - 1).scroll_into_view_if_needed()
+        items.nth(count - 1).scroll_into_view_if_needed(timeout=_PLAYWRIGHT_ACTION_TIMEOUT_MS)
         page.wait_for_timeout(random.randint(1000, 1500))
         return items.count()
 
@@ -972,7 +1178,10 @@ class SearchRunnerService:
         page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
         if wait_before:
             page.wait_for_timeout(random.choice([1450, 1560]))
-        button.click()
+        try:
+            button.click(timeout=_PLAYWRIGHT_ACTION_TIMEOUT_MS)
+        except timeout_error_type:
+            return
         if wait_after:
             page.wait_for_timeout(random.choice([1450, 1560]))
         try:
@@ -1270,62 +1479,108 @@ class SearchRunnerService:
         self._log(f"simulate_maps_action: старт для запроса '{query}'.")
         maps_url = self._build_maps_url(card_payload)
         browsers_path = self._prepare_runtime_browsers_path()
+        label = "simulate_maps_action"
+        playwright = None
+        browser = None
+        context = None
+        action_counts: dict[str, int] = {}
+        found = False
+        force_fast_close = False
+        browser_closed_externally = False
+        org_search_reached = False
         try:
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
             from playwright.sync_api import sync_playwright
 
-            with sync_playwright() as playwright:
-                browser = self._launch_chromium_with_recovery(playwright, browsers_path)
-                context = self._create_human_like_context(browser)
-                page = context.new_page()
-                self._log(f"simulate_maps_action: перехожу по ссылке {maps_url}")
-                page.goto(maps_url, wait_until="domcontentloaded")
-                self._handle_captcha_if_present(page, wait_ms=3000, context="после открытия карт")
-                maps_search_input = self._get_maps_search_input(page)
-                self._type_query_and_submit(page, maps_search_input, query)
-                self._handle_captcha_if_present(page, context=f"после отправки maps-запроса '{query}'")
-                try:
-                    page.wait_for_load_state("networkidle", timeout=7000)
-                except Exception:
-                    page.wait_for_timeout(1000)
-                
-                organization = str(card_payload.get("organization", ""))
-                found = self._find_and_open_maps_organization(
-                    page,
-                    organization,
-                    map_zoom_clicks,
-                    PlaywrightTimeoutError,
+            playwright = sync_playwright().start()
+            browser, context = self._launch_chromium_with_recovery(playwright, browsers_path)
+            page = self._open_browser_page(context)
+            self._log(f"{label}: перехожу по ссылке {maps_url}")
+            page.goto(maps_url, wait_until="domcontentloaded")
+            resolution = self._handle_captcha_if_present(page, wait_ms=3000, context="после открытия карт")
+            if self._captcha_blocks_progress(resolution):
+                self._log(
+                    f"{label}: капча не решена после открытия карт, "
+                    "завершаю поток досрочно — слот пула освободится для следующей попытки."
                 )
+                force_fast_close = True
+                return {"effect": False, "actions": {}}
+            maps_search_input = self._get_maps_search_input(page)
+            self._type_query_and_submit(page, maps_search_input, query)
+            resolution = self._handle_captcha_if_present(page, context=f"после отправки maps-запроса '{query}'")
+            if self._captcha_blocks_progress(resolution):
+                self._log(
+                    f"{label}: капча не решена после отправки запроса, "
+                    "завершаю поток досрочно — слот пула освободится для следующей попытки."
+                )
+                force_fast_close = True
+                return {"effect": False, "actions": {}}
+            try:
+                page.wait_for_load_state("networkidle", timeout=7000)
+            except Exception:
+                page.wait_for_timeout(1000)
 
-                action_counts: dict[str, int] = {}
-                if not found:
-                    self._log("simulate_maps_action: организация не найдена на картах.")
-                else:
-                    action_counts = self._run_maps_card_activity(
-                        page,
-                        action_budget=action_budget,
-                        min_sleep_target_tab_sec=min_sleep_target_tab_sec,
-                        max_sleep_target_tab_sec=max_sleep_target_tab_sec,
-                    )
-                    self._run_competitor_card_activity(
-                        page,
-                        chance_percent=competitor_open_chance_percent,
-                        max_open_cards=max_open_competitor_cards,
-                        min_sleep_sec=min_sleep_competitor_card_sec,
-                        max_sleep_sec=max_sleep_competitor_card_sec,
-                    )
+            org_search_reached = True
+            organization = str(card_payload.get("organization", ""))
+            found = self._find_and_open_maps_organization(
+                page,
+                organization,
+                map_zoom_clicks,
+                PlaywrightTimeoutError,
+            )
 
-                self._close_browser_session(context, browser, "simulate_browser_action_one_second")
-            self._log("simulate_maps_action: завершено успешно.")
-            return {"effect": True, "actions": action_counts}
+            if not found:
+                self._log(f"{label}: организация не найдена на картах.")
+            else:
+                action_counts = self._run_maps_card_activity(
+                    page,
+                    action_budget=action_budget,
+                    min_sleep_target_tab_sec=min_sleep_target_tab_sec,
+                    max_sleep_target_tab_sec=max_sleep_target_tab_sec,
+                )
+                self._run_competitor_card_activity(
+                    page,
+                    chance_percent=competitor_open_chance_percent,
+                    max_open_cards=max_open_competitor_cards,
+                    min_sleep_sec=min_sleep_competitor_card_sec,
+                    max_sleep_sec=max_sleep_competitor_card_sec,
+                )
+        except PlaywrightTimeoutError:
+            force_fast_close = True
+            self._log(f"{label}: таймаут Playwright (лимит {_PLAYWRIGHT_ACTION_TIMEOUT_MS} мс).")
         except Exception as error:
             if self._is_browser_closed_error(error):
+                force_fast_close = True
+                browser_closed_externally = True
                 self._log(
-                    f"simulate_maps_action: браузер закрыт/потерян ({error}), переоткрою без штрафа."
+                    f"{label}: браузер закрыт/потерян ({error}), переоткрою без штрафа."
                 )
                 return {"effect": False, "actions": {}, "closed": True}
-            self._log(f"simulate_maps_action: ошибка {error}")
+            force_fast_close = True
+            self._log(f"{label}: ошибка {error}")
             return {"effect": False, "actions": {}}
+        finally:
+            self._close_browser_session(
+                context,
+                browser,
+                label,
+                force_fast=force_fast_close,
+                skip_kill=browser_closed_externally,
+            )
+            self._stop_playwright_instance(
+                playwright,
+                label,
+                browser=browser,
+                force_fast=force_fast_close,
+                skip_kill=browser_closed_externally,
+            )
+            self._log(f"{label}: cleanup завершён, worker освобождён.")
+        self._log(f"{label}: завершено успешно.")
+        return {
+            "effect": found,
+            "actions": action_counts,
+            "count_failure": org_search_reached and not found,
+        }
 
     def _find_and_open_maps_organization(
         self,
@@ -1425,11 +1680,10 @@ class SearchRunnerService:
             action_budget.settle(action_label, reserved=attempts, performed=performed)
             if performed:
                 action_counts[action_label] = action_counts.get(action_label, 0) + performed
-        self._sleep_in_range_seconds(
+        self._run_maps_card_tabs_activity(
             page,
             min_sleep_target_tab_sec,
             max_sleep_target_tab_sec,
-            "simulate_maps_action: нахожусь в целевой карточке",
         )
         return action_counts
 
@@ -1978,11 +2232,258 @@ class SearchRunnerService:
         self._log(f"{reason}: {sleep_sec} сек.")
         page.wait_for_timeout(sleep_sec * 1000)
 
+    def _run_maps_card_tabs_activity(
+        self,
+        page,
+        min_sleep_sec: int,
+        max_sleep_sec: int,
+    ) -> None:
+        """После целевых действий имитирует изучение разделов карточки на картах.
+
+        Общее время «зависаний» (паузы + чтение) не превышает случайный бюджет
+        в диапазоне min/max сна на целевом действии карточки.
+        """
+        safe_min = max(0, min_sleep_sec)
+        safe_max = max(safe_min, max_sleep_sec)
+        if safe_max <= 0:
+            page.wait_for_timeout(random.randint(1000, 2000))
+            return
+
+        sleep_time_sec = random.randint(safe_min, safe_max)
+        self._log(
+            f"simulate_maps_action: имитация активности в разделах карточки "
+            f"{sleep_time_sec} сек."
+        )
+        end_time = time.time() + sleep_time_sec
+        visited_tabs: set[str] = set()
+        tab_specs = list(self._MAPS_CARD_TAB_SPECS)
+        random.shuffle(tab_specs)
+
+        while time.time() < end_time:
+            remaining_sec = end_time - time.time()
+            if remaining_sec <= 0.5:
+                break
+
+            tab_candidates = [tab for tab in tab_specs if tab[0] not in visited_tabs]
+            if not tab_candidates:
+                tab_candidates = tab_specs
+            tab_key, tab_label = random.choice(tab_candidates)
+
+            if self._switch_maps_org_tab(page, tab_key, tab_label, end_time):
+                visited_tabs.add(tab_key)
+                self._wait_within_budget(page, end_time, random.randint(1500, 3200))
+                section_budget_sec = min(
+                    remaining_sec,
+                    random.uniform(4.0, min(14.0, remaining_sec)),
+                )
+                self._browse_maps_org_tab(
+                    page,
+                    tab_key,
+                    tab_label,
+                    end_time=end_time,
+                    section_end=time.time() + section_budget_sec,
+                )
+
+            self._wait_within_budget(page, end_time, random.randint(1000, 2500))
+
+    @staticmethod
+    def _wait_within_budget(page, end_time: float, requested_ms: int) -> None:
+        """Ждёт не дольше, чем осталось до конца бюджета активности."""
+        remaining_ms = int(max(0.0, end_time - time.time()) * 1000)
+        if remaining_ms <= 0:
+            return
+        page.wait_for_timeout(min(requested_ms, remaining_ms))
+
+    def _switch_maps_org_tab(self, page, tab_key: str, tab_label: str, end_time: float) -> bool:
+        """Переключает вкладку карточки организации на картах."""
+        tab = page.locator(f".tabs-select-view__title._name_{tab_key}").first
+        if tab.count() == 0:
+            tab = page.locator(
+                f"[role='tab']:has(.tabs-select-view__label:text('{tab_label}'))"
+            ).first
+        if tab.count() == 0:
+            self._log(f"simulate_maps_action: вкладка '{tab_label}' не найдена.")
+            return False
+        try:
+            selected = tab.get_attribute("aria-selected")
+            tab.scroll_into_view_if_needed()
+            self._wait_within_budget(page, end_time, random.randint(800, 1500))
+            if selected != "true":
+                self._log(f"simulate_maps_action: перехожу во вкладку '{tab_label}'.")
+                tab.click(force=True)
+                self._wait_within_budget(page, end_time, random.randint(1200, 2200))
+                self._handle_captcha_if_present(
+                    page,
+                    wait_ms=1500,
+                    context=f"после перехода в раздел '{tab_label}'",
+                )
+            return True
+        except Exception as error:
+            self._log(f"simulate_maps_action: не удалось открыть вкладку '{tab_label}': {error}")
+            return False
+
+    def _browse_maps_org_tab(
+        self,
+        page,
+        tab_key: str,
+        tab_label: str,
+        *,
+        end_time: float,
+        section_end: float,
+    ) -> None:
+        """Скроллит текущую вкладку, иногда нажимает элементы и делает паузы."""
+        self._log(f"simulate_maps_action: изучаю раздел '{tab_label}'.")
+        while time.time() < section_end and time.time() < end_time:
+            self._scroll_visible_content(
+                page,
+                random.randint(250, 650) * random.choice([1, 1, -1]),
+            )
+            self._wait_within_budget(page, end_time, random.randint(1200, 2800))
+
+            roll = random.random()
+            if tab_key == "reviews" and roll < 0.55:
+                self._scroll_maps_reviews_tab(page, end_time)
+            elif tab_key == "gallery" and roll < 0.55:
+                self._browse_maps_gallery_tab(page, end_time)
+            elif tab_key == "menu" and roll < 0.45:
+                self._browse_maps_menu_tab(page, end_time)
+            elif tab_key == "overview" and roll < 0.5:
+                self._browse_maps_overview_widgets(page, end_time)
+            elif roll < 0.4:
+                self._click_random_maps_card_control(page, tab_key, end_time)
+            else:
+                self._idle_on_current_screen_within_budget(page, end_time)
+
+            self._wait_within_budget(page, end_time, random.randint(800, 1800))
+
+    def _idle_on_current_screen_within_budget(self, page, end_time: float) -> None:
+        """Короткая пауза «читаю экран» с учётом общего бюджета."""
+        remaining_ms = int(max(0.0, end_time - time.time()) * 1000)
+        if remaining_ms <= 0:
+            return
+        idle_ms = min(random.randint(2500, 7000), remaining_ms)
+        self._log(f"simulate_maps_action: читаю текущий экран ({idle_ms / 1000:.1f} сек)...")
+        page.wait_for_timeout(idle_ms)
+
+    def _click_random_maps_card_control(
+        self,
+        page,
+        tab_key: str,
+        end_time: float,
+    ) -> None:
+        """Случайно нажимает раскрываемый блок или интерактивный элемент вкладки."""
+        selectors = [
+            ".card-feature-view._interactive[role='button'][aria-expanded='false']",
+            ".business-working-status-flip-view._clickable",
+            ".masstransit-stops-view._clickable .card-feature-view._interactive",
+            ".business-header-rating-view__text._clickable",
+            ".card-feature-view._interactive.business-features-view__more-info",
+            ".search-sources-view__control",
+        ]
+        if tab_key in {"overview", "posts"}:
+            selectors.append(".story-preview")
+        if tab_key == "menu":
+            selectors.extend(
+                (
+                    ".related-product-view .image[role='button']",
+                    ".card-feature-view._interactive.business-card-view__menu-link",
+                )
+            )
+        controls = page.locator(", ".join(selectors))
+        count = controls.count()
+        if count <= 0:
+            return
+        index = random.randint(0, min(count - 1, 10))
+        target = controls.nth(index)
+        try:
+            if not target.is_visible():
+                return
+            label = (target.get_attribute("aria-label") or target.inner_text() or "элемент").strip()
+            self._log(f"simulate_maps_action: нажимаю '{label[:60]}'.")
+            target.scroll_into_view_if_needed()
+            self._wait_within_budget(page, end_time, random.randint(700, 1400))
+            target.click(force=True)
+            self._handle_captcha_if_present(page, wait_ms=1200, context="после клика в карточке")
+            self._wait_within_budget(page, end_time, random.randint(1500, 3500))
+        except Exception:
+            return
+
+    def _browse_maps_overview_widgets(self, page, end_time: float) -> None:
+        """Листает виджеты на вкладке «Обзор»: истории, меню-превью, карусели."""
+        widgets = page.locator(
+            ".story-preview, .carousel__scrollable, .card-related-products-view__top-items, "
+            ".business-attendance-view__day, .card-similar-carousel__item"
+        )
+        count = widgets.count()
+        if count <= 0:
+            return
+        index = random.randint(0, min(count - 1, 8))
+        widget = widgets.nth(index)
+        try:
+            if not widget.is_visible():
+                return
+            widget.scroll_into_view_if_needed()
+            self._wait_within_budget(page, end_time, random.randint(900, 1800))
+            if random.random() < 0.35:
+                widget.click(force=True)
+                self._wait_within_budget(page, end_time, random.randint(1800, 4200))
+        except Exception:
+            return
+
+    def _browse_maps_menu_tab(self, page, end_time: float) -> None:
+        """Листает позиции меню и иногда открывает карточку блюда."""
+        items = page.locator(".related-product-view, .card-feature-view._interactive")
+        count = items.count()
+        if count <= 0:
+            return
+        for _ in range(random.randint(2, 4)):
+            if time.time() >= end_time:
+                return
+            self._scroll_visible_content(page, random.randint(220, 520))
+            self._wait_within_budget(page, end_time, random.randint(1200, 2600))
+        if random.random() < 0.4:
+            self._click_random_maps_card_control(page, "menu", end_time)
+
+    def _browse_maps_gallery_tab(self, page, end_time: float) -> None:
+        """Листает фото и иногда открывает снимок."""
+        for _ in range(random.randint(2, 5)):
+            if time.time() >= end_time:
+                return
+            self._scroll_visible_content(page, random.randint(250, 600))
+            self._wait_within_budget(page, end_time, random.randint(1500, 3200))
+        photos = page.locator(".image[role='button'], .MediaGrid-Item, .Gallery-Item")
+        if photos.count() <= 0:
+            return
+        photo = photos.nth(random.randint(0, min(photos.count() - 1, 12)))
+        try:
+            if not photo.is_visible():
+                return
+            photo.scroll_into_view_if_needed()
+            photo.click(force=True)
+            self._handle_captcha_if_present(page, wait_ms=1500, context="после открытия фото на картах")
+            self._wait_within_budget(page, end_time, random.randint(2500, 5500))
+            self._close_photo_viewer(page)
+        except Exception:
+            return
+
+    def _scroll_maps_reviews_tab(self, page, end_time: float) -> None:
+        """Листает отзывы на вкладке «Отзывы» и иногда раскрывает длинный текст."""
+        for _ in range(random.randint(3, 6)):
+            if time.time() >= end_time:
+                return
+            self._scroll_visible_content(page, random.randint(280, 720))
+            self._wait_within_budget(page, end_time, random.randint(2200, 4500))
+            if random.random() < 0.25:
+                self._expand_random_review(page)
+
     def _launch_chromium_with_recovery(self, playwright, browsers_path: Path):
         """Запускает браузер и переустанавливает Chromium, если исполняемый файл пропал."""
         try:
             self._log("Пробую запустить браузер без переустановки.")
-            return self._launch_human_like_browser(playwright)
+            with self._browser_launch_lock:
+                before_pids = self._list_chrome_pids_near_python()
+                browser, context = self._launch_human_like_session(playwright)
+                self._remember_browser_pid(browser, before_pids=before_pids)
         except Exception as error:
             if not self._is_missing_executable_error(error):
                 self._log(f"Ошибка запуска браузера: {error}")
@@ -1990,7 +2491,161 @@ class SearchRunnerService:
             self._log("Браузерный бинарник отсутствует, выполняю переустановку Chromium.")
             self._install_chromium(browsers_path)
             self._log("Повторно запускаю браузер после установки.")
-            return self._launch_human_like_browser(playwright)
+            with self._browser_launch_lock:
+                before_pids = self._list_chrome_pids_near_python()
+                browser, context = self._launch_human_like_session(playwright)
+                self._remember_browser_pid(browser, before_pids=before_pids)
+        return browser, context
+
+    @staticmethod
+    def _open_browser_page(context):
+        if context.pages:
+            return context.pages[0]
+        return context.new_page()
+
+    def _pids_matching_user_data_dir(self, pids: set[int], user_data_dir: str) -> set[int]:
+        matched: set[int] = set()
+        for pid in pids:
+            command = self._process_command(pid) or ""
+            if user_data_dir in command:
+                matched.add(pid)
+        return matched
+
+    def _remember_browser_pid(self, browser, *, before_pids: set[int] | None = None) -> None:
+        """Сохраняет PID subprocess браузера для принудительного завершения."""
+        if browser is None:
+            return
+        process = self._browser_subprocess(browser)
+        if process is not None:
+            owned_pids = {process.pid}
+            with self._browser_pid_lock:
+                self._claimed_browser_pids.update(owned_pids)
+            browser._seo_soft_browser_pid = process.pid  # type: ignore[attr-defined]
+            browser._seo_soft_owned_pids = owned_pids  # type: ignore[attr-defined]
+            self._log(f"Сохранён pid процесса браузера: {process.pid}.")
+            return
+
+        baseline = before_pids if before_pids is not None else self._list_chrome_pids_near_python()
+        after_pids = self._list_chrome_pids_near_python()
+        new_pids = after_pids - baseline
+        if not new_pids:
+            time.sleep(0.2)
+            after_pids = self._list_chrome_pids_near_python()
+            new_pids = after_pids - baseline
+
+        candidate_pid = self._pick_browser_root_pid(new_pids)
+        user_data_dir = getattr(browser, "_seo_soft_user_data_dir", None)
+        if user_data_dir:
+            owned_pids = self._pids_matching_user_data_dir(new_pids, user_data_dir)
+            if not owned_pids:
+                owned_pids = self._pids_matching_user_data_dir(after_pids, user_data_dir)
+        else:
+            owned_pids = set()
+        if not owned_pids and candidate_pid is not None:
+            owned_pids = {candidate_pid}
+
+        with self._browser_pid_lock:
+            if candidate_pid is not None and candidate_pid in self._claimed_browser_pids:
+                unclaimed = sorted(pid for pid in owned_pids if pid not in self._claimed_browser_pids)
+                if unclaimed:
+                    candidate_pid = unclaimed[0]
+                else:
+                    candidate_pid = None
+            if candidate_pid is not None and owned_pids:
+                self._claimed_browser_pids.update(owned_pids)
+                browser._seo_soft_browser_pid = candidate_pid  # type: ignore[attr-defined]
+                browser._seo_soft_owned_pids = set(owned_pids)  # type: ignore[attr-defined]
+                self._log(
+                    f"Сохранены pid Chrome (diff pgrep): root={candidate_pid}, "
+                    f"owned={sorted(owned_pids)}."
+                )
+                return
+
+        self._log(
+            "Не удалось сохранить pid процесса браузера — "
+            "закрытие будет через os.kill по кэшу или пропуск kill."
+        )
+
+    def _release_browser_pid(self, browser) -> None:
+        owned = getattr(browser, "_seo_soft_owned_pids", None)
+        pid = getattr(browser, "_seo_soft_browser_pid", None)
+        with self._browser_pid_lock:
+            if owned:
+                for item in owned:
+                    self._claimed_browser_pids.discard(int(item))
+            elif pid is not None:
+                self._claimed_browser_pids.discard(int(pid))
+
+    @staticmethod
+    def _pick_browser_root_pid(candidate_pids: set[int]) -> int | None:
+        if not candidate_pids:
+            return None
+        return min(candidate_pids)
+
+    @staticmethod
+    def _process_command(pid: int) -> str | None:
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2,
+            )
+            return result.stdout.strip()
+        except Exception:
+            return None
+
+    def _collect_descendant_pids(self, root_pid: int, *, max_depth: int = 4) -> list[int]:
+        collected: list[int] = []
+        frontier = [root_pid]
+        for _ in range(max_depth):
+            next_frontier: list[int] = []
+            for parent_pid in frontier:
+                try:
+                    result = subprocess.run(
+                        ["pgrep", "-P", str(parent_pid)],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=2,
+                    )
+                except Exception:
+                    continue
+                for pid_str in result.stdout.split():
+                    try:
+                        child_pid = int(pid_str)
+                    except ValueError:
+                        continue
+                    collected.append(child_pid)
+                    next_frontier.append(child_pid)
+            frontier = next_frontier
+            if not frontier:
+                break
+        return collected
+
+    def _list_chrome_pids_near_python(self) -> set[int]:
+        try:
+            result = subprocess.run(
+                ["pgrep", "-P", str(os.getpid())],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=2,
+            )
+        except Exception:
+            return set()
+        candidate_pids = [int(pid_str) for pid_str in result.stdout.split() if pid_str.strip().isdigit()]
+        chrome_pids: set[int] = set()
+        for pid in candidate_pids:
+            command = self._process_command(pid)
+            if command and ("chrome" in command.lower() or "chromium" in command.lower()):
+                chrome_pids.add(pid)
+            for child_pid in self._collect_descendant_pids(pid, max_depth=2):
+                command = self._process_command(child_pid)
+                if command and ("chrome" in command.lower() or "chromium" in command.lower()):
+                    chrome_pids.add(child_pid)
+        return chrome_pids
 
     def _prepare_runtime_browsers_path(self) -> Path:
         """Готовит каталог браузеров Playwright и записывает его в окружение."""
@@ -1999,43 +2654,198 @@ class SearchRunnerService:
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_path)
         return browsers_path
 
-    def _close_browser_session(self, context, browser, label: str) -> None:
-        """Безопасно закрывает контекст и браузер.
+    @staticmethod
+    def _is_browser_disconnected(browser) -> bool:
+        if browser is None:
+            return True
+        try:
+            return not browser.is_connected()
+        except Exception:
+            return True
 
-        Браузер мог быть закрыт вручную, поэтому любые ошибки закрытия
-        проглатываются: они не должны прерывать прогон.
+    def _close_browser_session(
+        self,
+        context,
+        browser,
+        label: str,
+        *,
+        force_fast: bool = False,
+        skip_kill: bool = False,
+    ) -> None:
+        """Завершает браузерную сессию без graceful close.
+
+        Playwright Sync API нельзя вызывать из другого потока. Вызовы
+        ``context.close()`` / ``browser.close()`` на локальном Chrome часто
+        зависают на минуты даже после kill subprocess — worker не возвращается
+        в пул. Поэтому всегда завершаем только через kill процесса.
         """
-        self._log(f"{label}: закрываю контекст и браузер.")
-        try:
-            if context is not None:
-                context.close()
-        except Exception as error:
-            self._log(f"{label}: контекст уже закрыт или ошибка закрытия: {error}")
-        try:
-            if browser is not None:
-                browser.close()
-        except Exception as error:
-            self._log(f"{label}: браузер уже закрыт или ошибка закрытия: {error}")
+        del context  # контекст закрывается вместе с процессом браузера
+        if skip_kill:
+            self._log(f"{label}: браузер закрыт извне — принудительный kill пропущен.")
+            self._release_browser_pid(browser)
+            return
+        if force_fast:
+            self._log(f"{label}: закрываю браузер (быстрый режим после ошибки).")
+        else:
+            self._log(f"{label}: закрываю контекст и браузер.")
+        if self._kill_browser_subprocess(browser, label):
+            self._log(f"{label}: close-сессия завершена.")
+            return
+        if self._is_browser_disconnected(browser):
+            self._log(f"{label}: браузер уже отключён, close-сессия завершена.")
+            self._release_browser_pid(browser)
+            return
+        self._log(
+            f"{label}: pid браузера не найден — graceful close пропущен, "
+            "worker освобождён без ожидания Playwright."
+        )
 
-    def _launch_human_like_browser(self, playwright):
-        """Запускает локальный Chrome или встроенный Chromium в видимом режиме."""
-        launch_options = {
+    @staticmethod
+    def _browser_subprocess(browser):
+        if browser is None:
+            return None
+        try:
+            browser_process = browser._impl_obj._browser_process
+            process = getattr(browser_process, "process", None)
+            if process is not None:
+                return process
+            return getattr(browser_process, "_process", None)
+        except Exception:
+            return None
+
+    def _browser_pids_to_kill(self, browser) -> list[int]:
+        if browser is None:
+            return []
+        owned = getattr(browser, "_seo_soft_owned_pids", None)
+        if owned:
+            return sorted(int(pid) for pid in owned)
+
+        root_pids: list[int] = []
+        process = self._browser_subprocess(browser)
+        if process is not None and process.poll() is None:
+            root_pids.append(process.pid)
+        cached_pid = getattr(browser, "_seo_soft_browser_pid", None)
+        if cached_pid is not None and cached_pid not in root_pids:
+            root_pids.append(int(cached_pid))
+        return root_pids
+
+    def _kill_browser_subprocess(self, browser, label: str) -> bool:
+        if browser is None:
+            return False
+        if getattr(browser, "_seo_soft_killed", False):
+            return False
+        pids = self._browser_pids_to_kill(browser)
+        if not pids:
+            self._release_browser_pid(browser)
+            return False
+
+        process = self._browser_subprocess(browser)
+        if process is not None and process.poll() is None:
+            try:
+                self._log(f"{label}: принудительно завершаю процесс браузера (pid={process.pid}).")
+                process.kill()
+                process.wait(timeout=5)
+            except Exception as error:
+                self._log(f"{label}: process.kill() не сработал ({error}), пробую os.kill.")
+
+        killed_any = False
+        for pid in reversed(pids):
+            try:
+                os.kill(pid, signal.SIGKILL)
+                killed_any = True
+            except ProcessLookupError:
+                continue
+            except Exception as error:
+                self._log(f"{label}: os.kill({pid}) — {error}")
+        self._release_browser_pid(browser)
+        if killed_any:
+            browser._seo_soft_killed = True  # type: ignore[attr-defined]
+            self._log(f"{label}: завершены процессы браузера: {pids}.")
+        return killed_any
+
+    def _stop_playwright_instance(
+        self,
+        playwright,
+        label: str,
+        *,
+        browser=None,
+        force_fast: bool = False,
+        skip_kill: bool = False,
+    ) -> None:
+        """Останавливает Playwright в потоке worker'а, где был вызван sync_playwright().start().
+
+        Playwright Sync API привязан к greenlet текущего потока. Вызов stop() из другого
+        потока ломает ThreadPoolExecutor worker и следующие start() на том же потоке
+        падают с «Sync API inside the asyncio loop».
+        """
+        if playwright is None:
+            return
+
+        del force_fast
+        if skip_kill:
+            self._release_browser_pid(browser)
+        else:
+            self._kill_browser_subprocess(browser, label)
+
+        started = time.monotonic()
+        try:
+            playwright.stop()
+        except Exception as error:
+            self._log(f"{label}: playwright.stop() завершился с ошибкой: {error}")
+        else:
+            elapsed = time.monotonic() - started
+            if elapsed >= 0.3:
+                self._log(f"{label}: playwright.stop() занял {elapsed:.1f} с.")
+
+    def _launch_human_like_session(self, playwright):
+        """Запускает изолированный Chrome/Chromium через persistent context."""
+        user_data_dir = tempfile.mkdtemp(prefix="shagteampro-chrome-")
+        launch_kwargs = {
             "headless": False,
-            "args": ["--start-maximized", "--incognito"],
+            "no_viewport": True,
+            "user_agent": self.FORCED_USER_AGENT,
+            "locale": "ru-RU",
+            "ignore_default_args": list(_CHROME_IGNORED_DEFAULT_ARGS),
+            "args": [
+                "--start-maximized",
+            ],
+            "extra_http_headers": {
+                "sec-ch-ua": '"Not.A/Brand";v="99", "Chromium";v="136"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
         }
 
         chrome_path = self._local_chrome_executable_path()
         if chrome_path is not None:
             self._log(f"Запускаю локальный Chrome по пути: {chrome_path}")
-            return playwright.chromium.launch(executable_path=str(chrome_path), **launch_options)
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir,
+                executable_path=str(chrome_path),
+                **launch_kwargs,
+            )
+        else:
+            try:
+                self._log("Локальный путь не найден, запускаю channel='chrome'.")
+                context = playwright.chromium.launch_persistent_context(
+                    user_data_dir,
+                    channel="chrome",
+                    **launch_kwargs,
+                )
+            except Exception:
+                self._log("channel='chrome' недоступен, запускаю встроенный Chromium.")
+                context = playwright.chromium.launch_persistent_context(
+                    user_data_dir,
+                    **launch_kwargs,
+                )
 
-        # Prefer regular local Chrome channel to avoid "testing" branding when available.
-        try:
-            self._log("Локальный путь не найден, запускаю channel='chrome'.")
-            return playwright.chromium.launch(channel="chrome", **launch_options)
-        except Exception:
-            self._log("channel='chrome' недоступен, запускаю встроенный Chromium.")
-            return playwright.chromium.launch(**launch_options)
+        self._apply_human_like_fingerprint(context)
+        browser = context.browser
+        if browser is None:
+            raise RuntimeError("Persistent context запущен без browser handle.")
+        browser._seo_soft_user_data_dir = user_data_dir  # type: ignore[attr-defined]
+        return browser, context
 
     def _create_human_like_context(self, browser):
         """Создает браузерный контекст с фиксированным профилем Windows/Chromium."""
@@ -2051,7 +2861,12 @@ class SearchRunnerService:
                 "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
             },
         )
+        self._apply_human_like_fingerprint(context)
+        self._log("Контекст браузера успешно создан.")
+        return context
 
+    def _apply_human_like_fingerprint(self, context) -> None:
+        """Подменяет fingerprint браузера под Windows/Chromium."""
         context.add_init_script(
             """
             (() => {
@@ -2072,6 +2887,7 @@ class SearchRunnerService:
 
                 safeDefine(navigator, "userAgent", () => userAgent);
                 safeDefine(navigator, "platform", () => "Win32");
+                safeDefine(navigator, "webdriver", () => undefined);
                 safeDefine(
                     navigator,
                     "appVersion",
@@ -2131,9 +2947,7 @@ class SearchRunnerService:
             })();
             """
         )
-
         self._log("Контекст браузера успешно создан.")
-        return context
 
     def _install_chromium(self, browsers_path: Path) -> None:
         """Устанавливает Chromium Playwright в пользовательский runtime-каталог."""
@@ -2262,6 +3076,8 @@ class SearchRunnerService:
                 // Открытая карточка организации (OneOrgSimple) имеет приоритет:
                 // если она есть на экране, скроллим именно её, а не список выдачи.
                 const cardSelectors = [
+                    '.business-card-view__main-wrapper', '.business-tab-wrapper__content',
+                    '.business-card-overview-tab-view__content', '.business-card-view__tabs-view',
                     '.OneOrgMediaHorizontalPage', '.MediaGrid',
                     '.ReviewViewer-ReviewList', '.ReviewViewer-Main', '.ReviewViewer',
                     '.OneOrgSimple-Content', '.OneOrgSimple',
@@ -2395,15 +3211,22 @@ class SearchRunnerService:
         resolution = self._captcha_service.check_and_resolve(page, context=context, wait_ms=wait_ms)
         if resolution.detected and not resolution.solved:
             self._log(
-                "Капча не решена, дальнейший шаг может завершиться таймаутом. "
+                "Капча не решена. "
                 f"Детали: {resolution.message}"
             )
         return resolution
 
     @staticmethod
-    def _log(message: str) -> None:
+    def _captcha_blocks_progress(resolution) -> bool:
+        """True, если капча обнаружена, но не решена — дальнейшие шаги бессмысленны."""
+        return bool(resolution.detected and not resolution.solved)
+
+    @staticmethod
+    def _log(message: str, *, worker_id: str | None = None) -> None:
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{now}] [SearchRunnerService] {message}"
+        thread_id = worker_id or _log_worker_id.get()
+        thread_prefix = f"[{thread_id[:8]}] " if thread_id else ""
+        line = f"[{now}] [SearchRunnerService] {thread_prefix}{message}"
         print(line, flush=True)
         try:
             _get_run_logger().info(line)

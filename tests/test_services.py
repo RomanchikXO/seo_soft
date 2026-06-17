@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -193,6 +195,108 @@ def test_notification_mode_lines_include_percent_and_effect_keys() -> None:
     text = NotificationService.build_optimization_message(summary)
     assert "поиск 1/2 (50%)" in text
     assert "результативных ключей: 2" in text
+
+
+def test_wait_within_budget_caps_requested_sleep() -> None:
+    waited: list[int] = []
+
+    class _FakePage:
+        def wait_for_timeout(self, ms: int) -> None:
+            waited.append(ms)
+
+    SearchRunnerService._wait_within_budget(_FakePage(), time.time() + 0.2, 5000)
+    assert waited == [200]
+
+
+def test_run_maps_card_tabs_activity_stops_within_total_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SearchRunnerService()
+    switch_calls = {"count": 0}
+    clock = {"now": 1_000.0}
+
+    class _FakePage:
+        def wait_for_timeout(self, ms: int) -> None:
+            clock["now"] += ms / 1000
+
+    def fake_switch(_page, _tab_key: str, _tab_label: str, end_time: float) -> bool:
+        switch_calls["count"] += 1
+        assert end_time >= clock["now"]
+        return True
+
+    def fake_browse(*_args, **_kwargs) -> None:
+        clock["now"] += 1.5
+
+    monkeypatch.setattr(
+        "shagteampro.application.services.search_runner_service.time.time",
+        lambda: clock["now"],
+    )
+    monkeypatch.setattr(
+        "shagteampro.application.services.search_runner_service.random.randint",
+        lambda _a, _b: 5,
+    )
+    monkeypatch.setattr(service, "_switch_maps_org_tab", fake_switch)
+    monkeypatch.setattr(service, "_browse_maps_org_tab", fake_browse)
+
+    service._run_maps_card_tabs_activity(_FakePage(), min_sleep_sec=5, max_sleep_sec=5)
+
+    assert switch_calls["count"] >= 1
+    assert clock["now"] <= 1_006.0
+
+
+def test_consume_action_result_counts_failure_only_when_requested() -> None:
+    service = SearchRunnerService()
+    state: dict[str, object] = {
+        "card_id": 4,
+        "mode": "search",
+        "target": 3,
+        "active_keys": [{"id": 1, "phrase": "test"}],
+        "performed": 0,
+        "failures": 0,
+        "in_flight": 1,
+        "effect_key_ids": set(),
+        "action_counts": {},
+    }
+
+    class _Future:
+        def __init__(self, value: object) -> None:
+            self._value = value
+
+        def result(self) -> object:
+            return self._value
+
+    service._consume_action_result(
+        state,
+        {"id": 1, "phrase": "test"},
+        _Future({"effect": False, "actions": {}, "count_failure": False}),
+    )
+    assert state["failures"] == 0
+
+    state["in_flight"] = 1
+    service._consume_action_result(
+        state,
+        {"id": 1, "phrase": "test"},
+        _Future({"effect": False, "actions": {}, "count_failure": True}),
+    )
+    assert state["failures"] == 1
+
+
+def test_apply_target_state_does_not_double_count_maps_clicks() -> None:
+    service = SearchRunnerService()
+    card_entry: dict[str, object] = {"maps_action_counts": {}}
+    state: dict[str, object] = {
+        "mode": "maps",
+        "performed": 2,
+        "effect_key_ids": set(),
+        "action_counts": {"Показать телефон": 1, "Сайт": 1},
+    }
+
+    service._apply_target_state(card_entry, state)
+    assert card_entry["maps_action_counts"] == {"Показать телефон": 1, "Сайт": 1}
+
+    # Повторный вызов при обновлении прогресса не должен раздувать счётчики.
+    service._apply_target_state(card_entry, state)
+    assert card_entry["maps_action_counts"] == {"Показать телефон": 1, "Сайт": 1}
 
 
 def test_notification_renders_target_action_totals() -> None:
@@ -452,6 +556,143 @@ def test_dismiss_distribution_modal_clicks_close_button_and_always_presses_escap
     assert page.keyboard.pressed == ["Escape", "Escape", "Escape"]
 
 
+def test_stop_playwright_instance_stops_in_caller_thread() -> None:
+    service = SearchRunnerService()
+    caller_tid = threading.get_ident()
+    stop_thread_ids: list[int] = []
+
+    class _Playwright:
+        def stop(self) -> None:
+            stop_thread_ids.append(threading.get_ident())
+
+    service._stop_playwright_instance(_Playwright(), "test", skip_kill=True)
+    assert stop_thread_ids == [caller_tid]
+
+
+def test_close_browser_session_skips_kill_when_browser_closed_externally() -> None:
+    service = SearchRunnerService()
+    killed: list[int] = []
+
+    class _Browser:
+        _seo_soft_browser_pid = 5151
+
+        def is_connected(self) -> bool:
+            return False
+
+    monkeypatch_kill = service._kill_browser_subprocess
+    service._kill_browser_subprocess = lambda *_args, **_kwargs: killed.append(1) or True  # type: ignore[method-assign]
+    try:
+        service._close_browser_session(None, _Browser(), "test", skip_kill=True)
+    finally:
+        service._kill_browser_subprocess = monkeypatch_kill  # type: ignore[method-assign]
+
+    assert killed == []
+    assert 5151 not in service._claimed_browser_pids
+
+
+def test_remember_browser_pid_uses_unclaimed_pid_from_diff(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = SearchRunnerService()
+    service._claimed_browser_pids.add(91794)
+
+    class _Browser:
+        _impl_obj = object()
+        _seo_soft_user_data_dir = "/tmp/shagteampro-chrome-test"
+
+    browser = _Browser()
+    monkeypatch.setattr(
+        service,
+        "_list_chrome_pids_near_python",
+        lambda: {91794, 91804, 92500, 92501},
+    )
+    monkeypatch.setattr(
+        service,
+        "_process_command",
+        lambda pid: {
+            92500: "Google Chrome --user-data-dir=/tmp/shagteampro-chrome-test",
+            92501: "Google Chrome Helper --user-data-dir=/tmp/shagteampro-chrome-test",
+            91794: "Google Chrome --user-data-dir=/tmp/other-profile",
+        }.get(pid, ""),
+    )
+
+    service._remember_browser_pid(browser, before_pids={91794, 91804})
+    assert browser._seo_soft_browser_pid == 92500
+    assert browser._seo_soft_owned_pids == {92500, 92501}
+    assert service._claimed_browser_pids == {91794, 92500, 92501}
+
+
+def test_kill_browser_subprocess_runs_only_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = SearchRunnerService()
+    kill_count = 0
+
+    class _Browser:
+        _seo_soft_owned_pids = {101}
+        _seo_soft_killed = False
+
+    browser = _Browser()
+    monkeypatch.setattr("shagteampro.application.services.search_runner_service.os.kill", lambda *_args, **_kwargs: None)
+
+    assert service._kill_browser_subprocess(browser, "test") is True
+    kill_count = 1
+    assert service._kill_browser_subprocess(browser, "test") is False
+    assert browser._seo_soft_killed is True
+    assert kill_count == 1
+
+
+def test_browser_pids_to_kill_uses_only_owned_processes() -> None:
+    service = SearchRunnerService()
+
+    class _Browser:
+        _seo_soft_owned_pids = {101, 102, 103}
+        _seo_soft_browser_pid = 101
+
+    assert service._browser_pids_to_kill(_Browser()) == [101, 102, 103]
+
+
+def test_remember_browser_pid_stores_subprocess_pid() -> None:
+    service = SearchRunnerService()
+
+    class _Proc:
+        pid = 9090
+
+    class _Browser:
+        _impl_obj = type("Impl", (), {"_browser_process": type("BP", (), {"process": _Proc()})()})()
+
+    browser = _Browser()
+    service._remember_browser_pid(browser)
+    assert browser._seo_soft_browser_pid == 9090
+
+
+def test_close_browser_session_skips_graceful_close_and_kills_process() -> None:
+    service = SearchRunnerService()
+    closed_calls: list[str] = []
+    killed: list[int] = []
+
+    class _Proc:
+        pid = 5151
+
+        def poll(self) -> None:
+            return None
+
+        def kill(self) -> None:
+            killed.append(self.pid)
+
+        def wait(self, timeout: int = 5) -> int:
+            return 0
+
+    class _Browser:
+        _impl_obj = type("Impl", (), {"_browser_process": type("BP", (), {"process": _Proc()})()})()
+
+        def is_connected(self) -> bool:
+            return True
+
+        def close(self) -> None:
+            closed_calls.append("close")
+
+    service._close_browser_session(None, _Browser(), "test")
+    assert closed_calls == []
+    assert killed == [5151]
+
+
 class _PhotoViewerPage:
     """Фейковая страница лайтбокса фото.
 
@@ -589,15 +830,16 @@ def test_search_runner_retries_after_missing_browser(monkeypatch: pytest.MonkeyP
         launch_calls.append("launch")
         if len(launch_calls) == 1:
             raise RuntimeError("Executable doesn't exist")
-        return "browser-object"
+        return "browser-object", "context-object"
 
     def fake_install(path: Path) -> None:
         install_calls.append(path)
 
-    monkeypatch.setattr(service, "_launch_human_like_browser", fake_launch)
+    monkeypatch.setattr(service, "_launch_human_like_session", fake_launch)
     monkeypatch.setattr(service, "_install_chromium", fake_install)
-    browser = service._launch_chromium_with_recovery(object(), tmp_path / "pw")
+    browser, context = service._launch_chromium_with_recovery(object(), tmp_path / "pw")
     assert browser == "browser-object"
+    assert context == "context-object"
     assert install_calls == [tmp_path / "pw"]
 
 
@@ -1425,6 +1667,12 @@ def test_search_runner_run_maps_card_activity_forwards_sleep_range_to_actions(
         return attempts
 
     monkeypatch.setattr(service, "_perform_maps_action_clicks", fake_perform)
+    tabs_calls: list[tuple[int, int]] = []
+
+    def fake_tabs_activity(_page, min_sec: int, max_sec: int) -> None:
+        tabs_calls.append((min_sec, max_sec))
+
+    monkeypatch.setattr(service, "_run_maps_card_tabs_activity", fake_tabs_activity)
     service._run_maps_card_activity(
         object(),
         action_budget=_ActionBudget({"Маршрут": 4, "Показать телефон": 2}),
@@ -1437,6 +1685,7 @@ def test_search_runner_run_maps_card_activity_forwards_sleep_range_to_actions(
         ("Показать телефон", 1, 7, 9),
         ("CTA", 1, 7, 9),
     ]
+    assert tabs_calls == [(7, 9)]
 
 
 def test_search_runner_route_sleep_happens_before_captcha(monkeypatch: pytest.MonkeyPatch) -> None:
