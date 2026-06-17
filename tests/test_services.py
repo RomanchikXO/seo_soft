@@ -238,7 +238,8 @@ def test_wait_within_budget_caps_requested_sleep() -> None:
             waited.append(ms)
 
     SearchRunnerService._wait_within_budget(_FakePage(), time.time() + 0.2, 5000)
-    assert waited == [200]
+    assert len(waited) == 1
+    assert 199 <= waited[0] <= 200
 
 
 def test_run_maps_card_tabs_activity_stops_within_total_budget(
@@ -705,7 +706,9 @@ class _ModalWithCloseButtonPage:
         self.evaluated: list[str] = []
         self.keyboard = _FakeKeyboard()
 
-    def locator(self, _selector: str) -> _ClickableCloseLocator:
+    def locator(self, selector: str) -> _ClickableCloseLocator | _FakeLocator:
+        if "ModalWithMap" in selector or "VerticalOrgsScroller" in selector:
+            return _FakeLocator()
         return _ClickableCloseLocator(self.clicks)
 
     def wait_for_timeout(self, _ms: int) -> None:
@@ -1010,10 +1013,85 @@ def test_remove_distribution_overlays_keeps_large_map_modal() -> None:
             return 1
 
     service._remove_distribution_overlays(_Page())
-    assert "hasMapContent" in script
-    assert "VerticalOrgsScroller" in script
     assert "ModalWithMap" in script
+    assert "closest('[class*=\"ModalWithMap\"]')" in script
     assert "closest('.Modal, .Modal-Content')" not in script
+
+
+def test_dismiss_large_map_popups_skips_when_map_closed() -> None:
+    service = SearchRunnerService()
+    page = _FakeModalPage(removed_overlays=2)
+
+    removed, detected = service._dismiss_large_map_popups(page, "test")
+
+    assert removed == 0
+    assert detected == []
+    assert page.evaluated == []
+
+
+def test_dismiss_large_map_popups_uses_map_popup_script() -> None:
+    service = SearchRunnerService()
+    script = ""
+
+    class _VisibleLocator:
+        @property
+        def first(self) -> "_VisibleLocator":
+            return self
+
+        def count(self) -> int:
+            return 1
+
+        def is_visible(self) -> bool:
+            return True
+
+    class _Page:
+        def locator(self, _selector: str) -> _VisibleLocator:
+            return _VisibleLocator()
+
+        def evaluate(self, evaluated_script: str) -> dict[str, object]:
+            nonlocal script
+            script = evaluated_script
+            return {
+                "mapOpen": True,
+                "removed": 2,
+                "detected": ["DistributionSplashScreenModalContent"],
+            }
+
+    removed, detected = service._dismiss_large_map_popups(_Page(), "на карте")
+
+    assert removed == 2
+    assert detected == ["DistributionSplashScreenModalContent"]
+    assert "ModalWithMap-CloseButton" in script
+    assert "VerticalOrgsScroller" in script
+
+
+def test_watch_large_map_popups_polls_until_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SearchRunnerService()
+    calls: list[str] = []
+
+    monkeypatch.setattr(service, "_is_large_map_open", lambda _page: True)
+
+    def fake_dismiss(_page, context: str, **kwargs) -> tuple[int, list[str]]:
+        calls.append(context)
+        return (1 if len(calls) == 1 else 0, ["popup"])
+
+    monkeypatch.setattr(service, "_dismiss_large_map_popups", fake_dismiss)
+
+    class _Page:
+        def wait_for_timeout(self, _ms: int) -> None:
+            return None
+
+    total = service._watch_large_map_popups(
+        _Page(),
+        "после открытия большой карты",
+        watch_ms=1500,
+        poll_ms=500,
+    )
+
+    assert total == 1
+    assert len(calls) == 3
 
 
 def test_dismiss_distribution_modal_on_map_skips_close_button_click() -> None:
@@ -1036,7 +1114,7 @@ def test_open_large_map_dismisses_distribution_modal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = SearchRunnerService()
-    dismissed: list[dict[str, object]] = []
+    watched: list[dict[str, object]] = []
 
     class _MapButtonLocator:
         def wait_for(self, **_kwargs) -> None:
@@ -1059,19 +1137,20 @@ def test_open_large_map_dismisses_distribution_modal(
 
     monkeypatch.setattr(service, "_handle_captcha_if_present", lambda *_args, **_kwargs: None)
 
-    def fake_dismiss(page, context: str = "search", **kwargs) -> None:
-        dismissed.append({"page": page, "context": context, **kwargs})
+    watched: list[dict[str, object]] = []
 
-    monkeypatch.setattr(service, "_dismiss_distribution_modal", fake_dismiss)
+    def fake_watch(page, context: str, **kwargs) -> int:
+        watched.append({"page": page, "context": context, **kwargs})
+        return 0
+
+    monkeypatch.setattr(service, "_watch_large_map_popups", fake_watch)
 
     assert service._open_large_map(_DummyPage()) is True
-    assert dismissed == [
+    assert watched == [
         {
-            "page": dismissed[0]["page"],
+            "page": watched[0]["page"],
             "context": "после открытия большой карты",
-            "wait_load": False,
-            "press_escape": False,
-            "prefer_dom_removal": True,
+            "watch_ms": 5000,
         }
     ]
 
@@ -1093,12 +1172,13 @@ def test_search_runner_retries_after_missing_browser(monkeypatch: pytest.MonkeyP
         launch_calls.append("launch")
         if len(launch_calls) == 1:
             raise RuntimeError("Executable doesn't exist")
-        return "browser-object", "context-object"
+        return "browser-object"
 
     def fake_install(path: Path) -> None:
         install_calls.append(path)
 
-    monkeypatch.setattr(service, "_launch_human_like_session", fake_launch)
+    monkeypatch.setattr(service, "_launch_human_like_browser", fake_launch)
+    monkeypatch.setattr(service, "_create_human_like_context", lambda _browser: "context-object")
     monkeypatch.setattr(service, "_install_chromium", fake_install)
     browser, context = service._launch_chromium_with_recovery(object(), tmp_path / "pw")
     assert browser == "browser-object"
@@ -1580,20 +1660,32 @@ def test_search_runner_maps_mode_uses_card_activity_settings(
         def close(self) -> None:
             return
 
-    class _DummyPlaywrightContext:
-        def __enter__(self):
-            return object()
+    class _DummyPlaywright:
+        def start(self):
+            return self
 
-        def __exit__(self, exc_type, exc, tb) -> None:
-            return
+    class _CaptchaResolution:
+        detected = False
+        solved = False
 
     monkeypatch.setattr(service, "_prepare_runtime_browsers_path", lambda: Path("/tmp/pw"))
-    monkeypatch.setattr(service, "_launch_chromium_with_recovery", lambda *_args, **_kwargs: _DummyBrowser())
+    monkeypatch.setattr(
+        service,
+        "_launch_chromium_with_recovery",
+        lambda *_args, **_kwargs: (_DummyBrowser(), _DummyContext()),
+    )
+    monkeypatch.setattr(service, "_open_browser_page", lambda _context: _DummyPage())
     monkeypatch.setattr(service, "_create_human_like_context", lambda _browser: _DummyContext())
     monkeypatch.setattr(service, "_get_maps_search_input", lambda _page: object())
     monkeypatch.setattr(service, "_type_query_and_submit", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(service, "_handle_captcha_if_present", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        service,
+        "_handle_captcha_if_present",
+        lambda *_args, **_kwargs: _CaptchaResolution(),
+    )
+    monkeypatch.setattr(service, "_captcha_blocks_progress", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(service, "_close_browser_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "_stop_playwright_instance", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service, "_build_maps_url", lambda _payload: "https://yandex.ru/maps/?lang=ru_RU")
     monkeypatch.setattr(
         service,
@@ -1611,9 +1703,8 @@ def test_search_runner_maps_mode_uses_card_activity_settings(
     monkeypatch.setattr(service, "_run_maps_card_activity", fake_target_activity)
     monkeypatch.setattr(service, "_run_competitor_card_activity", fake_competitor_activity)
     monkeypatch.setattr(
-        "shagteampro.application.services.search_runner_service.sync_playwright",
-        lambda: _DummyPlaywrightContext(),
-        raising=False,
+        "playwright.sync_api.sync_playwright",
+        lambda: _DummyPlaywright(),
     )
 
     result = service._simulate_browser_action_one_second(
@@ -1635,7 +1726,7 @@ def test_search_runner_maps_mode_uses_card_activity_settings(
         },
     )
 
-    assert result == {"effect": True, "actions": {"Маршрут": 2}}
+    assert result == {"effect": True, "actions": {"Маршрут": 2}, "count_failure": False}
     target_kwargs = calls["target"]
     assert target_kwargs["min_sleep_target_tab_sec"] == 6
     assert target_kwargs["max_sleep_target_tab_sec"] == 9

@@ -10,7 +10,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import uuid
@@ -102,10 +101,6 @@ class _ActionBudget:
 
 _PLAYWRIGHT_ACTION_TIMEOUT_MS = 5_000
 _DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY = 100
-_CHROME_IGNORED_DEFAULT_ARGS = (
-    "--enable-automation",
-    "--no-sandbox",
-)
 
 
 class SearchRunnerService:
@@ -940,6 +935,81 @@ class SearchRunnerService:
         ".DistributionSplashScreenModalContent .Button_view_clear",
     )
 
+    _LARGE_MAP_OPEN_SELECTORS: tuple[str, ...] = (
+        '[class*="ModalWithMap"]',
+        "ul.VerticalOrgsScroller-List",
+    )
+
+    # Убирает только всплывашки внутри большой карты, не трогая сам ModalWithMap.
+    _DISMISS_LARGE_MAP_POPUPS_JS: str = """
+        () => {
+            const mapRoot = document.querySelector('[class*="ModalWithMap"]');
+            if (!mapRoot) {
+                return { mapOpen: false, removed: 0, detected: [] };
+            }
+            const protectedSelectors = [
+                '[class*="VerticalOrgsScroller"]',
+                '[class*="OrgmnColumn"]',
+                '[class*="ymaps3"]',
+                '[class*="CompaniesModal-OneOrg"]',
+                '[class*="OrgCard"]',
+                '[class*="ModalWithMap-CloseButton"]',
+            ];
+            const popupMarkers = [
+                '[class*="DistributionSplashScreen"]',
+                '[class*="Distribution"]',
+                '.DistributionTitle',
+                '[class*="SplashScreen"]',
+            ];
+            const isInsideProtected = (node) => protectedSelectors.some(
+                (selector) => node.matches?.(selector) || node.closest(selector)
+            );
+            const hasMapContent = (node) => node.querySelector(
+                '[class*="VerticalOrgsScroller"], [class*="ymaps3"], [class*="OrgCard"]'
+            );
+            const detected = [];
+            const seen = new Set();
+            const removeNode = (node) => {
+                if (!node || node === mapRoot || seen.has(node) || isInsideProtected(node)) {
+                    return;
+                }
+                seen.add(node);
+                const label = typeof node.className === 'string'
+                    ? node.className
+                    : node.getAttribute?.('role') || node.nodeName;
+                detected.push(String(label).slice(0, 120));
+                node.remove();
+            };
+
+            for (const marker of popupMarkers) {
+                for (const node of mapRoot.querySelectorAll(marker)) {
+                    if (isInsideProtected(node)) continue;
+                    removeNode(node);
+                }
+            }
+
+            for (const dialog of mapRoot.querySelectorAll('[role="dialog"], .Modal-Content')) {
+                if (dialog === mapRoot || isInsideProtected(dialog) || hasMapContent(dialog)) {
+                    continue;
+                }
+                const isPromo = dialog.querySelector(
+                    '[class*="Distribution"], [class*="SplashScreen"], .DistributionTitle'
+                );
+                if (!isPromo) continue;
+                removeNode(dialog);
+            }
+
+            for (const child of mapRoot.children) {
+                if (isInsideProtected(child) || hasMapContent(child)) continue;
+                const isOverlay = child.matches?.('[role="dialog"], .Modal-Content') ||
+                    child.querySelector('[class*="Splash"], [class*="Distribution"], .DistributionTitle');
+                if (isOverlay) removeNode(child);
+            }
+
+            return { mapOpen: true, removed: seen.size, detected };
+        }
+    """
+
     _PHOTO_VIEWER_CLOSE_SELECTORS: tuple[str, ...] = (
         ".MediaViewer-ButtonClose",
         ".MediaViewer-Close",
@@ -1000,6 +1070,70 @@ class SearchRunnerService:
         }
     """
 
+    def _is_large_map_open(self, page) -> bool:
+        """Проверяет, что на странице открыта большая карта с организациями."""
+        for selector in self._LARGE_MAP_OPEN_SELECTORS:
+            try:
+                locator = page.locator(selector).first
+                if locator.count() > 0 and locator.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    @staticmethod
+    def _evaluate_large_map_popup_dismissal(page) -> dict[str, object]:
+        """Возвращает результат JS-очистки всплывашек на большой карте."""
+        try:
+            result = page.evaluate(SearchRunnerService._DISMISS_LARGE_MAP_POPUPS_JS)
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            pass
+        return {"mapOpen": False, "removed": 0, "detected": []}
+
+    def _dismiss_large_map_popups(
+        self,
+        page,
+        context: str = "large_map",
+        *,
+        log: bool = True,
+    ) -> tuple[int, list[str]]:
+        """Убирает всплывашки только внутри большой карты, не закрывая саму карту."""
+        if not self._is_large_map_open(page):
+            return 0, []
+        result = self._evaluate_large_map_popup_dismissal(page)
+        removed = int(result.get("removed", 0) or 0)
+        detected = [str(item) for item in (result.get("detected", []) or [])]
+        if log and removed:
+            labels = ", ".join(detected) if detected else "без классов"
+            self._log(
+                f"{context}: убрал всплывашки на большой карте ({removed} шт.): {labels}."
+            )
+        return removed, detected
+
+    def _watch_large_map_popups(
+        self,
+        page,
+        context: str,
+        *,
+        watch_ms: int = 5000,
+        poll_ms: int = 500,
+    ) -> int:
+        """Следит за отложенными всплывашками на большой карте и убирает их по мере появления."""
+        if not self._is_large_map_open(page):
+            return 0
+        total_removed = 0
+        elapsed_ms = 0
+        while elapsed_ms < watch_ms:
+            removed, _detected = self._dismiss_large_map_popups(page, context)
+            total_removed += removed
+            if elapsed_ms + poll_ms >= watch_ms:
+                break
+            page.wait_for_timeout(poll_ms)
+            elapsed_ms += poll_ms
+        return total_removed
+
     def _dismiss_distribution_modal(
         self,
         page,
@@ -1028,12 +1162,13 @@ class SearchRunnerService:
         closed = False
         if not prefer_dom_removal:
             closed = self._close_distribution_if_present(page, context)
-        if not closed:
+        if self._is_large_map_open(page):
+            self._dismiss_large_map_popups(page, context)
+        elif not closed:
             removed = self._remove_distribution_overlays(page)
             if removed:
                 self._log(
-                    f"{context}: {'убрал' if prefer_dom_removal else 'кнопка закрытия не найдена, удалил'}"
-                    f" промо-оверлеи через JS ({removed} шт.)."
+                    f"{context}: кнопка закрытия не найдена, удалил промо-оверлеи через JS ({removed} шт.)."
                 )
 
         if press_escape:
@@ -1073,13 +1208,7 @@ class SearchRunnerService:
 
     @staticmethod
     def _remove_distribution_overlays(page) -> int:
-        """Удаляет из DOM промо-блоки Distribution и возвращает их число.
-
-        Нужен для отложенного сплэша «Установить Яндекс Браузер?»
-        (`DistributionSplashScreenModalContent`): у него нет кнопки закрытия,
-        только ссылка «Да», которую жать нельзя. Поэтому такой оверлей просто
-        убирается из DOM, чтобы он не перехватывал скроллы и клики.
-        """
+        """Удаляет промо-блоки Distribution вне большой карты (на SERP и т.п.)."""
         script = """
         () => {
             const distributionSelectors = [
@@ -1104,15 +1233,9 @@ class SearchRunnerService:
                 node.remove();
                 removed += 1;
             };
-            for (const mapModal of document.querySelectorAll('[class*="ModalWithMap"]')) {
-                for (const selector of distributionSelectors) {
-                    for (const node of mapModal.querySelectorAll(selector)) {
-                        removeNode(node);
-                    }
-                }
-            }
             for (const selector of distributionSelectors) {
                 for (const node of document.querySelectorAll(selector)) {
+                    if (node.closest('[class*="ModalWithMap"]')) continue;
                     removeNode(node);
                 }
             }
@@ -1154,14 +1277,8 @@ class SearchRunnerService:
             return False
         self._log("simulate_search_action: открыта большая карта.")
         self._handle_captcha_if_present(page, wait_ms=3000, context="после открытия большой карты")
-        page.wait_for_timeout(random.randint(2000, 3000))
-        self._dismiss_distribution_modal(
-            page,
-            context="после открытия большой карты",
-            wait_load=False,
-            press_escape=False,
-            prefer_dom_removal=True,
-        )
+        page.wait_for_timeout(random.randint(1000, 2000))
+        self._watch_large_map_popups(page, "после открытия большой карты", watch_ms=5000)
         return True
 
     def _find_and_open_organization(
@@ -1186,6 +1303,7 @@ class SearchRunnerService:
         last_count = 0
         retries = 0
         while retries < 3:
+            self._dismiss_large_map_popups(page, "поиск организации на карте")
             items = page.locator("li.VerticalOrgsScroller-Item")
             count = items.count()
             if count <= 0:
@@ -1229,25 +1347,13 @@ class SearchRunnerService:
         page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
         self._click_organization_card(item_locator, title_locator)
         page.wait_for_timeout(random.randint(400, 800))
-        self._dismiss_distribution_modal(
-            page,
-            context="simulate_search_action",
-            wait_load=False,
-            press_escape=False,
-            prefer_dom_removal=True,
-        )
+        self._watch_large_map_popups(page, "после клика по организации", watch_ms=3000)
         if not self._wait_for_organization_card_opened(page, organization):
             self._log(
                 f"simulate_search_action: карточка '{actual_title}' не открылась после клика, "
-                "повторно закрываю промо-модалку «Сделать Яндекс основным поиском?»."
+                "повторно убираю всплывашки на большой карте."
             )
-            self._dismiss_distribution_modal(
-                page,
-                context="simulate_search_action",
-                wait_load=False,
-                press_escape=False,
-                prefer_dom_removal=True,
-            )
+            self._watch_large_map_popups(page, "повтор после клика по организации", watch_ms=2000)
             if not self._wait_for_organization_card_opened(page, organization):
                 self._log(
                     f"simulate_search_action: карточка '{actual_title}' не открылась после клика, пропускаю."
@@ -1348,6 +1454,7 @@ class SearchRunnerService:
         else:
             self._click_zoom_button(page, zoom_in_btn, timeout_error_type, wait_before=True)
         self._handle_captcha_if_present(page, wait_ms=2000, context=f"после zoom-итерации #{step + 1}")
+        self._dismiss_large_map_popups(page, f"после zoom-итерации #{step + 1}")
 
     @staticmethod
     def _click_zoom_button(
@@ -1389,9 +1496,9 @@ class SearchRunnerService:
 
         sleep_time_sec = random.randint(min_sleep_overview, max_sleep_overview)
         self._log(f"simulate_search_action: имитация активности в карточке {sleep_time_sec} сек.")
-        # Внутри модалки карты НЕ жмём Esc и не кликаем «Нет, спасибо» —
-        # это закрыло бы саму карту. Гасим только промо-сплэш через JS.
-        self._remove_distribution_overlays(page)
+        # Внутри модалки карты НЕ жмём Esc и не кликаем кнопки закрытия промо —
+        # это закрыло бы саму карту. Следим за отложенными всплывашками через JS.
+        self._dismiss_large_map_popups(page, "overview")
         end_time = page.evaluate("Date.now()") + (sleep_time_sec * 1000)
         visited_sections: set[str] = set()
         actions = {
@@ -1402,7 +1509,7 @@ class SearchRunnerService:
         }
 
         while page.evaluate("Date.now()") < end_time:
-            self._remove_distribution_overlays(page)
+            self._dismiss_large_map_popups(page, "overview")
             self._scroll_visible_content(
                 page,
                 random.randint(200, 500) * random.choice([1, 1, -1]),
@@ -2667,7 +2774,8 @@ class SearchRunnerService:
             self._log("Пробую запустить браузер без переустановки.")
             with self._browser_launch_lock:
                 before_pids = self._list_chrome_pids_near_python()
-                browser, context = self._launch_human_like_session(playwright)
+                browser = self._launch_human_like_browser(playwright)
+                context = self._create_human_like_context(browser)
                 self._remember_browser_pid(browser, before_pids=before_pids)
         except Exception as error:
             if not self._is_missing_executable_error(error):
@@ -2678,7 +2786,8 @@ class SearchRunnerService:
             self._log("Повторно запускаю браузер после установки.")
             with self._browser_launch_lock:
                 before_pids = self._list_chrome_pids_near_python()
-                browser, context = self._launch_human_like_session(playwright)
+                browser = self._launch_human_like_browser(playwright)
+                context = self._create_human_like_context(browser)
                 self._remember_browser_pid(browser, before_pids=before_pids)
         return browser, context
 
@@ -2982,55 +3091,24 @@ class SearchRunnerService:
             if elapsed >= 0.3:
                 self._log(f"{label}: playwright.stop() занял {elapsed:.1f} с.")
 
-    def _launch_human_like_session(self, playwright):
-        """Запускает изолированный Chrome/Chromium через persistent context."""
-        user_data_dir = tempfile.mkdtemp(prefix="shagteampro-chrome-")
-        launch_kwargs = {
+    def _launch_human_like_browser(self, playwright):
+        """Запускает локальный Chrome или встроенный Chromium в видимом режиме."""
+        launch_options = {
             "headless": False,
-            "no_viewport": True,
-            "user_agent": self.FORCED_USER_AGENT,
-            "locale": "ru-RU",
-            "ignore_default_args": list(_CHROME_IGNORED_DEFAULT_ARGS),
-            "args": [
-                "--start-maximized",
-            ],
-            "extra_http_headers": {
-                "sec-ch-ua": '"Not.A/Brand";v="99", "Chromium";v="136"',
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Windows"',
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            },
+            "args": ["--start-maximized", "--incognito"],
         }
 
         chrome_path = self._local_chrome_executable_path()
         if chrome_path is not None:
             self._log(f"Запускаю локальный Chrome по пути: {chrome_path}")
-            context = playwright.chromium.launch_persistent_context(
-                user_data_dir,
-                executable_path=str(chrome_path),
-                **launch_kwargs,
-            )
-        else:
-            try:
-                self._log("Локальный путь не найден, запускаю channel='chrome'.")
-                context = playwright.chromium.launch_persistent_context(
-                    user_data_dir,
-                    channel="chrome",
-                    **launch_kwargs,
-                )
-            except Exception:
-                self._log("channel='chrome' недоступен, запускаю встроенный Chromium.")
-                context = playwright.chromium.launch_persistent_context(
-                    user_data_dir,
-                    **launch_kwargs,
-                )
+            return playwright.chromium.launch(executable_path=str(chrome_path), **launch_options)
 
-        self._apply_human_like_fingerprint(context)
-        browser = context.browser
-        if browser is None:
-            raise RuntimeError("Persistent context запущен без browser handle.")
-        browser._seo_soft_user_data_dir = user_data_dir  # type: ignore[attr-defined]
-        return browser, context
+        try:
+            self._log("Локальный путь не найден, запускаю channel='chrome'.")
+            return playwright.chromium.launch(channel="chrome", **launch_options)
+        except Exception:
+            self._log("channel='chrome' недоступен, запускаю встроенный Chromium.")
+            return playwright.chromium.launch(**launch_options)
 
     def _create_human_like_context(self, browser):
         """Создает браузерный контекст с фиксированным профилем Windows/Chromium."""
