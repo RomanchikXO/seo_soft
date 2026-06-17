@@ -1007,6 +1007,7 @@ class SearchRunnerService:
         *,
         wait_load: bool = True,
         press_escape: bool = True,
+        prefer_dom_removal: bool = False,
     ) -> None:
         """Закрывает промо-модалку Яндекса (в т.ч. «Сделать Яндекс основным поиском?»).
 
@@ -1014,17 +1015,25 @@ class SearchRunnerService:
         реальную кнопку закрытия «Нет, спасибо» (естественное поведение), а при её
         отсутствии удаляет оверлей из DOM.
 
+        На открытой большой карте (`prefer_dom_removal=True`) кнопку «Нет, спасибо»
+        жать нельзя: в Яндексе этот клик закрывает весь `ModalWithMap`, а не только
+        промо. Там оверлей убирается только через JS.
+
         Esc жмётся только если `press_escape=True`. На открытой карте/карте организации
         Esc закрывает саму карту — там его использовать нельзя.
         """
         if wait_load:
             self._wait_for_full_load(page)
 
-        if not self._close_distribution_if_present(page, context):
+        closed = False
+        if not prefer_dom_removal:
+            closed = self._close_distribution_if_present(page, context)
+        if not closed:
             removed = self._remove_distribution_overlays(page)
             if removed:
                 self._log(
-                    f"{context}: кнопка закрытия не найдена, удалил промо-оверлеи через JS ({removed} шт.)."
+                    f"{context}: {'убрал' if prefer_dom_removal else 'кнопка закрытия не найдена, удалил'}"
+                    f" промо-оверлеи через JS ({removed} шт.)."
                 )
 
         if press_escape:
@@ -1082,18 +1091,29 @@ class SearchRunnerService:
                 '.VerticalOrgsScroller',
                 '.VerticalOrgsScroller-List',
                 '.OrgmnColumn',
+                '[class*="ModalWithMap"]',
             ];
             let removed = 0;
             const seen = new Set();
             const hasMapContent = (node) => mapMarkers.some(
-                (selector) => node.querySelector(selector)
+                (selector) => node.matches?.(selector) || node.querySelector(selector)
             );
+            const removeNode = (node) => {
+                if (!node || seen.has(node)) return;
+                seen.add(node);
+                node.remove();
+                removed += 1;
+            };
+            for (const mapModal of document.querySelectorAll('[class*="ModalWithMap"]')) {
+                for (const selector of distributionSelectors) {
+                    for (const node of mapModal.querySelectorAll(selector)) {
+                        removeNode(node);
+                    }
+                }
+            }
             for (const selector of distributionSelectors) {
                 for (const node of document.querySelectorAll(selector)) {
-                    if (seen.has(node)) continue;
-                    seen.add(node);
-                    node.remove();
-                    removed += 1;
+                    removeNode(node);
                 }
             }
             for (const modal of document.querySelectorAll('.Modal, .Modal-Content')) {
@@ -1103,9 +1123,7 @@ class SearchRunnerService:
                 if (!hasDistribution || hasMapContent(modal) || seen.has(modal)) {
                     continue;
                 }
-                seen.add(modal);
-                modal.remove();
-                removed += 1;
+                removeNode(modal);
             }
             return removed;
         }
@@ -1142,6 +1160,7 @@ class SearchRunnerService:
             context="после открытия большой карты",
             wait_load=False,
             press_escape=False,
+            prefer_dom_removal=True,
         )
         return True
 
@@ -1215,6 +1234,7 @@ class SearchRunnerService:
             context="simulate_search_action",
             wait_load=False,
             press_escape=False,
+            prefer_dom_removal=True,
         )
         if not self._wait_for_organization_card_opened(page, organization):
             self._log(
@@ -1226,6 +1246,7 @@ class SearchRunnerService:
                 context="simulate_search_action",
                 wait_load=False,
                 press_escape=False,
+                prefer_dom_removal=True,
             )
             if not self._wait_for_organization_card_opened(page, organization):
                 self._log(
@@ -1368,9 +1389,9 @@ class SearchRunnerService:
 
         sleep_time_sec = random.randint(min_sleep_overview, max_sleep_overview)
         self._log(f"simulate_search_action: имитация активности в карточке {sleep_time_sec} сек.")
-        # Внутри модалки карты НЕ жмём Esc и не трогаем общие кнопки закрытия —
-        # это закрыло бы саму карту. Гасим только промо-сплэш по спец-селекторам.
-        self._close_distribution_if_present(page, context="overview")
+        # Внутри модалки карты НЕ жмём Esc и не кликаем «Нет, спасибо» —
+        # это закрыло бы саму карту. Гасим только промо-сплэш через JS.
+        self._remove_distribution_overlays(page)
         end_time = page.evaluate("Date.now()") + (sleep_time_sec * 1000)
         visited_sections: set[str] = set()
         actions = {
@@ -1381,7 +1402,7 @@ class SearchRunnerService:
         }
 
         while page.evaluate("Date.now()") < end_time:
-            self._close_distribution_if_present(page, context="overview")
+            self._remove_distribution_overlays(page)
             self._scroll_visible_content(
                 page,
                 random.randint(200, 500) * random.choice([1, 1, -1]),

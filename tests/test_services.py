@@ -1012,7 +1012,24 @@ def test_remove_distribution_overlays_keeps_large_map_modal() -> None:
     service._remove_distribution_overlays(_Page())
     assert "hasMapContent" in script
     assert "VerticalOrgsScroller" in script
+    assert "ModalWithMap" in script
     assert "closest('.Modal, .Modal-Content')" not in script
+
+
+def test_dismiss_distribution_modal_on_map_skips_close_button_click() -> None:
+    service = SearchRunnerService()
+    page = _ModalWithCloseButtonPage()
+
+    service._dismiss_distribution_modal(
+        page,
+        context="после открытия большой карты",
+        press_escape=False,
+        prefer_dom_removal=True,
+    )
+
+    assert page.clicks == []
+    assert any("DistributionSplashScreen" in script for script in page.evaluated)
+    assert page.keyboard.pressed == []
 
 
 def test_open_large_map_dismisses_distribution_modal(
@@ -1054,6 +1071,7 @@ def test_open_large_map_dismisses_distribution_modal(
             "context": "после открытия большой карты",
             "wait_load": False,
             "press_escape": False,
+            "prefer_dom_removal": True,
         }
     ]
 
