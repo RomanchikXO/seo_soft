@@ -362,7 +362,7 @@ def test_notification_renders_key_failures_and_splits_long_messages() -> None:
     assert "Org 1" in text
     assert "ключ-1" in text
     assert "1</b> неудач" in text
-    assert "50</b> неудач" in text
+    assert "100</b> неудач" in text
 
     chunks = NotificationService.split_message_for_telegram(text)
     assert len(chunks) > 1
@@ -449,11 +449,16 @@ def test_merge_key_failure_reports_keeps_search_and_maps_separately() -> None:
     ]
 
 
-def test_attempts_reserved_counts_success_failures_and_in_flight() -> None:
+def test_pick_dispatchable_target_stops_at_success_target_not_on_failures() -> None:
     state = {"performed": 2, "failures": 3, "in_flight": 1, "target": 10, "active_keys": [{}]}
-    assert SearchRunnerService._attempts_reserved(state) == 6
+    assert SearchRunnerService._scheduled_successes(state) == 3
     assert SearchRunnerService._pick_dispatchable_target([state]) is state
-    state["failures"] = 7
+    state["failures"] = 99
+    assert SearchRunnerService._pick_dispatchable_target([state]) is state
+    state["performed"] = 10
+    state["in_flight"] = 0
+    assert SearchRunnerService._pick_dispatchable_target([state]) is None
+    state = {"performed": 9, "failures": 0, "in_flight": 1, "target": 10, "active_keys": [{}]}
     assert SearchRunnerService._pick_dispatchable_target([state]) is None
 
 
@@ -994,6 +999,49 @@ def test_remove_distribution_overlays_swallows_evaluate_errors() -> None:
     assert service._remove_distribution_overlays(_BrokenPage()) == 0
 
 
+def test_open_large_map_dismisses_distribution_modal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SearchRunnerService()
+    dismissed: list[dict[str, object]] = []
+
+    class _MapButtonLocator:
+        def wait_for(self, **_kwargs) -> None:
+            return
+
+        def click(self, **_kwargs) -> None:
+            return
+
+        @property
+        def first(self) -> "_MapButtonLocator":
+            return self
+
+    class _DummyPage:
+        def locator(self, selector: str) -> _MapButtonLocator:
+            assert selector == "a.OrgmnColumn-MapButton"
+            return _MapButtonLocator()
+
+        def wait_for_timeout(self, _ms: int) -> None:
+            return
+
+    monkeypatch.setattr(service, "_handle_captcha_if_present", lambda *_args, **_kwargs: None)
+
+    def fake_dismiss(page, context: str = "search", **kwargs) -> None:
+        dismissed.append({"page": page, "context": context, **kwargs})
+
+    monkeypatch.setattr(service, "_dismiss_distribution_modal", fake_dismiss)
+
+    assert service._open_large_map(_DummyPage()) is True
+    assert dismissed == [
+        {
+            "page": dismissed[0]["page"],
+            "context": "после открытия большой карты",
+            "wait_load": False,
+            "press_escape": False,
+        }
+    ]
+
+
 def test_search_runner_build_maps_url_with_trimmed_coordinates() -> None:
     maps_url = SearchRunnerService._build_maps_url({"coordinates": " 37.631182, 55.771363 "})
     assert maps_url == "https://yandex.ru/maps/?ll=37.631182,55.771363&z=17&lang=ru_RU"
@@ -1137,7 +1185,7 @@ def test_search_runner_optimization_runs_search_and_maps_for_same_card(
     assert result["cards"][0]["maps_effect_keys"] == [10]
 
 
-def test_search_runner_retries_single_key_until_transition_budget(
+def test_search_runner_retries_single_key_until_key_failure_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = SearchRunnerService()
@@ -1163,16 +1211,24 @@ def test_search_runner_retries_single_key_until_transition_budget(
         threads=1,
     )
 
-    assert len(calls) == 4
+    assert len(calls) == SearchRunnerService.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY
     assert result["total_search_performed"] == 0
-    assert result["total_failed_attempts"] == 4
-    assert result["exhausted_keys"] == []
+    assert result["total_failed_attempts"] == SearchRunnerService.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY
+    assert result["exhausted_keys"] == [
+        {
+            "key_id": 10,
+            "phrase": "",
+            "mode": "search",
+            "failures": SearchRunnerService.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY,
+            "card_name": "Card",
+        }
+    ]
     assert result["key_failure_reports"] == [
         {
             "key_id": 10,
             "phrase": "",
             "mode": "search",
-            "failures": 4,
+            "failures": SearchRunnerService.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY,
             "card_name": "Card",
         }
     ]
@@ -1339,12 +1395,60 @@ def test_search_runner_keeps_random_rotation_with_multiple_keys(
         threads=1,
     )
 
-    assert result["total_search_performed"] == 5
-    assert result["total_failed_attempts"] == 5
+    assert result["total_search_performed"] == 10
+    assert result["total_failed_attempts"] == 10
     assert result["cards"][0]["search_effect_keys"] == [20]
     assert 10 in calls
     assert 20 in calls
-    assert len(calls) == 10
+    assert len(calls) == 20
+
+
+def test_search_runner_keeps_going_until_success_target_with_multiple_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SearchRunnerService()
+    monkeypatch.setattr(service, "ensure_chromium_installed", lambda: False)
+    calls: list[int] = []
+    success_after = {11: 2, 12: 4, 13: 1}
+    attempts: dict[int, int] = {11: 0, 12: 0, 13: 0}
+    key_order = iter([12, 12, 13, 11, 12, 12, 13])
+
+    def fake_choice(keys: list[dict[str, object]]) -> dict[str, object]:
+        next_id = next(key_order)
+        return next(key for key in keys if int(key["id"]) == next_id)
+
+    def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]):
+        key_id = int(key_payload["id"])
+        calls.append(key_id)
+        attempts[key_id] += 1
+        if attempts[key_id] >= success_after[key_id]:
+            return True
+        return {"effect": False, "actions": {}, "count_failure": True}
+
+    monkeypatch.setattr("shagteampro.application.services.search_runner_service.random.choice", fake_choice)
+    monkeypatch.setattr(service, "_simulate_search_action", fake_search)
+
+    result = service.run_cards_optimization(
+        cards=[
+            {
+                "card_id": 1,
+                "card_name": "Card",
+                "search_target": 3,
+                "maps_target": 0,
+                "keys": [
+                    {"id": 11, "search_enabled": True, "maps_enabled": False},
+                    {"id": 12, "search_enabled": True, "maps_enabled": False},
+                    {"id": 13, "search_enabled": True, "maps_enabled": False},
+                ],
+            }
+        ],
+        threads=1,
+    )
+
+    assert result["total_search_performed"] == 3
+    assert result["total_failed_attempts"] == 4
+    assert len(calls) == 7
+    assert set(result["cards"][0]["search_effect_keys"]) == {12, 13}
 
 
 def test_simulate_search_action_counts_missing_org_block_as_failure(

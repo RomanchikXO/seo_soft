@@ -101,7 +101,7 @@ class _ActionBudget:
 
 
 _PLAYWRIGHT_ACTION_TIMEOUT_MS = 5_000
-_DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY = 50
+_DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY = 100
 _CHROME_IGNORED_DEFAULT_ARGS = (
     "--enable-automation",
     "--no-sandbox",
@@ -493,21 +493,17 @@ class SearchRunnerService:
             )
 
     @staticmethod
-    def _attempts_reserved(state: dict[str, object]) -> int:
-        """Возвращает число уже занятых попыток: успешные, неудачные и выполняющиеся."""
-        return (
-            int(state.get("performed", 0) or 0)
-            + int(state.get("failures", 0) or 0)
-            + int(state.get("in_flight", 0) or 0)
-        )
+    def _scheduled_successes(state: dict[str, object]) -> int:
+        """Возвращает число успешных переходов плюс уже запущенные (in_flight)."""
+        return int(state.get("performed", 0) or 0) + int(state.get("in_flight", 0) or 0)
 
     @staticmethod
     def _pick_dispatchable_target(targets: list[dict[str, object]]) -> dict[str, object] | None:
-        """Выбирает цель, которой еще нужны действия и есть свободный «бюджет» на отправку."""
+        """Выбирает цель, которой ещё нужны успешные переходы и есть активные ключи."""
         for state in targets:
             if not state["active_keys"]:
                 continue
-            if SearchRunnerService._attempts_reserved(state) >= int(state["target"]):
+            if SearchRunnerService._scheduled_successes(state) >= int(state["target"]):
                 continue
             return state
         return None
@@ -598,14 +594,14 @@ class SearchRunnerService:
         """Обрабатывает провал: организация не найдена в списке или на выдаче нет блока организаций.
 
         Ключ остаётся в ротации до ``DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY`` неудач
-        или пока не исчерпан общий бюджет попыток режима (``target``). Транзитные
+        или пока не набрано целевое число успешных переходов (``target``). Транзитные
         сбои (капча, таймаут до отправки запроса и т.п.) сюда не попадают.
         """
         failures_for_key = self._increment_key_failure(state, key_payload)
         card_id = state["card_id"]
         mode = state["mode"]
         key_id = int(key_payload.get("id", 0) or 0)
-        attempts_used = int(state.get("failures", 0) or 0) + int(state.get("performed", 0) or 0)
+        performed = int(state.get("performed", 0) or 0)
         target = int(state["target"])
 
         if failures_for_key >= self.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY:
@@ -618,7 +614,7 @@ class SearchRunnerService:
         self._log(
             f"Карточка #{card_id}: {mode} — неудачная попытка по ключу #{key_id} "
             f"{failures_for_key}/{self.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY}, "
-            f"общий бюджет {attempts_used}/{target}."
+            f"успешно {performed}/{target}."
         )
 
     def _execute_single_action(
@@ -934,6 +930,8 @@ class SearchRunnerService:
         }
 
     _DISTRIBUTION_CLOSE_SELECTORS: tuple[str, ...] = (
+        ".Modal-Content .DistributionButtonClose",
+        ".Modal-Content .DistributionActions button.DistributionButtonClose",
         ".DistributionSplashScreenModalContent button.DistributionButtonClose",
         ".DistributionSplashScreenModalContent button:has-text('Нет, спасибо')",
         ".DistributionActions button.DistributionButtonClose",
@@ -1126,6 +1124,12 @@ class SearchRunnerService:
         self._log("simulate_search_action: открыта большая карта.")
         self._handle_captcha_if_present(page, wait_ms=3000, context="после открытия большой карты")
         page.wait_for_timeout(random.randint(2000, 3000))
+        self._dismiss_distribution_modal(
+            page,
+            context="после открытия большой карты",
+            wait_load=False,
+            press_escape=False,
+        )
         return True
 
     def _find_and_open_organization(
