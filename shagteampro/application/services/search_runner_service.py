@@ -930,15 +930,13 @@ class SearchRunnerService:
         }
 
     _DISTRIBUTION_CLOSE_SELECTORS: tuple[str, ...] = (
-        ".Modal-Content .DistributionButtonClose",
-        ".Modal-Content .DistributionActions button.DistributionButtonClose",
+        ".Modal-Content:has(.DistributionSplashScreenModalContent) .DistributionButtonClose",
+        ".Modal-Content:has(.DistributionSplashScreenModalContent) .DistributionActions button.DistributionButtonClose",
         ".DistributionSplashScreenModalContent button.DistributionButtonClose",
         ".DistributionSplashScreenModalContent button:has-text('Нет, спасибо')",
         ".DistributionActions button.DistributionButtonClose",
         "button.DistributionSplashScreenModalCloseButtonOuter",
         "button[aria-label='Нет, спасибо']",
-        "button:has-text('Нет, спасибо')",
-        ".DistributionButtonClose",
         ".DistributionSplashScreenModalContent .Button_view_clear",
     )
 
@@ -1075,24 +1073,39 @@ class SearchRunnerService:
         """
         script = """
         () => {
-            const selectors = [
+            const distributionSelectors = [
                 '.DistributionSplashScreenModal',
                 '.DistributionSplashScreenModalContent',
                 '[class*="DistributionSplashScreen"]',
-                '.DistributionSplashScreenModalContent .Distribution',
-                '.Modal-Content:has(.DistributionSplashScreenModalContent)',
-                '.Modal:has(.DistributionTitle)',
+            ];
+            const mapMarkers = [
+                '.VerticalOrgsScroller',
+                '.VerticalOrgsScroller-List',
+                '.OrgmnColumn',
             ];
             let removed = 0;
             const seen = new Set();
-            for (const selector of selectors) {
+            const hasMapContent = (node) => mapMarkers.some(
+                (selector) => node.querySelector(selector)
+            );
+            for (const selector of distributionSelectors) {
                 for (const node of document.querySelectorAll(selector)) {
-                    const root = node.closest('.Modal, .Modal-Content') || node;
-                    if (seen.has(root)) continue;
-                    seen.add(root);
-                    root.remove();
+                    if (seen.has(node)) continue;
+                    seen.add(node);
+                    node.remove();
                     removed += 1;
                 }
+            }
+            for (const modal of document.querySelectorAll('.Modal, .Modal-Content')) {
+                const hasDistribution = modal.querySelector(
+                    '.DistributionSplashScreenModalContent, [class*="DistributionSplashScreen"], .DistributionTitle'
+                );
+                if (!hasDistribution || hasMapContent(modal) || seen.has(modal)) {
+                    continue;
+                }
+                seen.add(modal);
+                modal.remove();
+                removed += 1;
             }
             return removed;
         }

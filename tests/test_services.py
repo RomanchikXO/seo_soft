@@ -999,6 +999,22 @@ def test_remove_distribution_overlays_swallows_evaluate_errors() -> None:
     assert service._remove_distribution_overlays(_BrokenPage()) == 0
 
 
+def test_remove_distribution_overlays_keeps_large_map_modal() -> None:
+    service = SearchRunnerService()
+    script = ""
+
+    class _Page:
+        def evaluate(self, evaluated_script: str) -> int:
+            nonlocal script
+            script = evaluated_script
+            return 1
+
+    service._remove_distribution_overlays(_Page())
+    assert "hasMapContent" in script
+    assert "VerticalOrgsScroller" in script
+    assert "closest('.Modal, .Modal-Content')" not in script
+
+
 def test_open_large_map_dismisses_distribution_modal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
