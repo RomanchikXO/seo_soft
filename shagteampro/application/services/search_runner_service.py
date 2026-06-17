@@ -251,7 +251,10 @@ class SearchRunnerService:
         progress_run_id: str | None = None,
     ) -> dict[str, object]:
         """Запускает оптимизацию карточек по выбранным поисковым и картографическим ключам."""
-        from shagteampro.application.services.optimization_progress import update_run_from_targets
+        from shagteampro.application.services.optimization_progress import (
+            update_run_from_targets,
+            was_stopped_by_user,
+        )
 
         self._update_captcha_service()
         prepared_cards = [card for card in cards if card.get("card_id") is not None]
@@ -290,7 +293,10 @@ class SearchRunnerService:
         for state in targets:
             self._apply_target_state(card_results[state["card_id"]], state)
 
-        return self._build_optimization_summary(card_results)
+        summary = self._build_optimization_summary(card_results)
+        if was_stopped_by_user(progress_run_id):
+            summary["stopped_by_user"] = True
+        return summary
 
     def _empty_card_result(self, card_payload: dict[str, object]) -> dict[str, object]:
         """Создает начальную строку результата оптимизации для одной карточки.
@@ -390,7 +396,11 @@ class SearchRunnerService:
         потоке наполняет пул, поэтому при N потоках одновременно открывается до N браузеров,
         даже если все действия идут по одной фразе/ключу.
         """
-        from shagteampro.application.services.optimization_progress import update_run_from_targets
+        from shagteampro.application.services.optimization_progress import (
+            get_dispatch_control,
+            is_dispatch_allowed,
+            update_run_from_targets,
+        )
 
         if not targets:
             return
@@ -415,7 +425,12 @@ class SearchRunnerService:
                 action_completed=action_completed,
             )
 
+        def has_pending_work() -> bool:
+            return self._pick_dispatchable_target(targets) is not None
+
         def fill(executor: concurrent.futures.Executor) -> None:
+            if not is_dispatch_allowed(progress_run_id):
+                return
             while len(future_meta) < max_workers:
                 state = self._pick_dispatchable_target(targets)
                 if state is None:
@@ -433,8 +448,30 @@ class SearchRunnerService:
                 report_progress(state=state)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            fill(executor)
-            while future_meta:
+            while True:
+                control = get_dispatch_control(progress_run_id) if progress_run_id else "active"
+                if control == "stopping":
+                    if not future_meta:
+                        self._log("Пул: остановка по запросу пользователя, новые окна не открываются.")
+                        break
+                elif control == "active":
+                    fill(executor)
+                    if not future_meta and not has_pending_work():
+                        break
+
+                if not future_meta:
+                    if control == "paused":
+                        time.sleep(0.3)
+                        continue
+                    if control == "stopping":
+                        break
+                    if control == "active" and not has_pending_work():
+                        break
+                    if control == "active":
+                        time.sleep(0.1)
+                        continue
+                    break
+
                 done, _ = concurrent.futures.wait(
                     future_meta.keys(), return_when=concurrent.futures.FIRST_COMPLETED
                 )
@@ -447,7 +484,6 @@ class SearchRunnerService:
                         worker_id=worker_id,
                     )
                     report_progress(key_payload, state, action_completed=True)
-                fill(executor)
 
         for state in targets:
             mode = state["mode"]

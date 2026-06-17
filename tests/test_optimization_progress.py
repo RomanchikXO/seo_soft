@@ -5,6 +5,9 @@ from shagteampro.application.services.optimization_progress import (
     create_run,
     finish_run,
     get_run_snapshot,
+    pause_run,
+    request_stop_run,
+    resume_run,
     update_run_from_targets,
 )
 
@@ -95,6 +98,30 @@ def test_optimization_progress_snapshot_tracks_cards_and_timing() -> None:
     assert done["search_performed"] == 2
     assert done["maps_performed"] == 1
     assert done["estimated_remaining_seconds"] == 0.0
+
+
+def test_run_dispatch_control_pause_resume_and_stop() -> None:
+    cards_payload = [
+        {
+            "card_id": 1,
+            "card_name": "Card A",
+            "search_target": 2,
+            "maps_target": 0,
+            "keys": [{"id": 10, "search_enabled": True, "maps_enabled": False}],
+        }
+    ]
+    run_id = create_run(2, cards_payload)
+
+    assert get_run_snapshot(run_id)["dispatch_control"] == "active"
+    assert pause_run(run_id) is True
+    assert get_run_snapshot(run_id)["dispatch_control"] == "paused"
+    assert pause_run(run_id) is False
+    assert resume_run(run_id) is True
+    assert get_run_snapshot(run_id)["dispatch_control"] == "active"
+    assert request_stop_run(run_id) is True
+    snapshot = get_run_snapshot(run_id)
+    assert snapshot["dispatch_control"] == "stopping"
+    assert snapshot["stopped_by_user"] is True
 
 
 def test_processed_count_ignores_failed_attempts() -> None:

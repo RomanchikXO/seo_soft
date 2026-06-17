@@ -20,6 +20,9 @@ from shagteampro.application.services.optimization_progress import (
     create_run,
     finish_run,
     get_run_snapshot,
+    pause_run,
+    request_stop_run,
+    resume_run,
 )
 from shagteampro.application.services.search_runner_service import SearchRunnerService
 from shagteampro.application.services.settings_service import SettingsService
@@ -467,6 +470,24 @@ def create_app(base_dir: Path | None = None, services: AppServices | None = None
         if snapshot is None:
             raise HTTPException(status_code=404, detail="Задача оптимизации не найдена.")
         return snapshot
+
+    @app.post("/api/optimization/pause/{run_id}")
+    def optimization_pause(run_id: str) -> dict[str, bool]:
+        if not pause_run(run_id):
+            raise HTTPException(status_code=409, detail="Задачу нельзя поставить на паузу.")
+        return {"ok": True}
+
+    @app.post("/api/optimization/resume/{run_id}")
+    def optimization_resume(run_id: str) -> dict[str, bool]:
+        if not resume_run(run_id):
+            raise HTTPException(status_code=409, detail="Задачу нельзя возобновить.")
+        return {"ok": True}
+
+    @app.post("/api/optimization/stop/{run_id}")
+    def optimization_stop(run_id: str) -> dict[str, bool]:
+        if not request_stop_run(run_id):
+            raise HTTPException(status_code=409, detail="Задачу нельзя остановить.")
+        return {"ok": True}
 
     @app.post("/api/yandex-org/autofill")
     def yandex_org_autofill(payload: YandexOrgAutofillRequest) -> dict[str, str]:

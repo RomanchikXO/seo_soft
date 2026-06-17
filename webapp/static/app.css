@@ -613,8 +613,30 @@ input[type="time"]:focus {
   font-weight: 700;
   color: #e8ffe8;
 }
-.task-cancel {
+.task-card.paused {
+  border-color: rgba(100, 149, 237, 0.5);
+  background: linear-gradient(180deg, rgba(100, 149, 237, 0.12), rgba(100, 149, 237, 0.03));
+}
+.task-card.paused .task-dot {
+  background: #6495ed;
+  box-shadow: 0 0 0 4px rgba(100, 149, 237, 0.2);
+}
+.task-controls {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   margin-left: auto;
+}
+.task-control {
+  padding: 5px 8px;
+  font-size: 11px;
+  min-width: 52px;
+}
+.task-control:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.task-cancel {
   flex: 0 0 auto;
   padding: 6px 10px;
   font-size: 12px;
@@ -622,7 +644,8 @@ input[type="time"]:focus {
 .task-card-clickable {
   cursor: pointer;
 }
-.task-card-clickable .task-cancel {
+.task-card-clickable .task-cancel,
+.task-card-clickable .task-control {
   cursor: pointer;
 }
 .task-stats {

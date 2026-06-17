@@ -77,6 +77,8 @@ def create_run(threads: int, cards: list[dict[str, object]]) -> str:
     with _lock:
         _runs[run_id] = {
             "status": "running",
+            "dispatch_control": "active",
+            "stopped_by_user": False,
             "started_at": datetime.datetime.now().isoformat(timespec="seconds"),
             "threads": int(threads),
             "total_key_phrases": count_enabled_key_phrases(cards),
@@ -87,6 +89,64 @@ def create_run(threads: int, cards: list[dict[str, object]]) -> str:
             "error": None,
         }
     return run_id
+
+
+def get_dispatch_control(run_id: str) -> str | None:
+    with _lock:
+        run = _runs.get(run_id)
+        if run is None:
+            return None
+        return str(run.get("dispatch_control", "active"))
+
+
+def is_dispatch_allowed(run_id: str | None) -> bool:
+    if not run_id:
+        return True
+    return get_dispatch_control(run_id) == "active"
+
+
+def pause_run(run_id: str) -> bool:
+    with _lock:
+        run = _runs.get(run_id)
+        if run is None or run.get("status") != "running":
+            return False
+        if run.get("dispatch_control") != "active":
+            return False
+        run["dispatch_control"] = "paused"
+        return True
+
+
+def resume_run(run_id: str) -> bool:
+    with _lock:
+        run = _runs.get(run_id)
+        if run is None or run.get("status") != "running":
+            return False
+        if run.get("dispatch_control") != "paused":
+            return False
+        run["dispatch_control"] = "active"
+        return True
+
+
+def request_stop_run(run_id: str) -> bool:
+    with _lock:
+        run = _runs.get(run_id)
+        if run is None or run.get("status") != "running":
+            return False
+        if run.get("dispatch_control") == "stopping":
+            return True
+        run["dispatch_control"] = "stopping"
+        run["stopped_by_user"] = True
+        return True
+
+
+def was_stopped_by_user(run_id: str | None) -> bool:
+    if not run_id:
+        return False
+    with _lock:
+        run = _runs.get(run_id)
+        if run is None:
+            return False
+        return bool(run.get("stopped_by_user"))
 
 
 def _extract_clicks(action_counts: object) -> dict[str, int]:
@@ -233,6 +293,8 @@ def _serialize_run(run: dict[str, Any]) -> dict[str, object]:
 
     return {
         "status": run.get("status", "running"),
+        "dispatch_control": run.get("dispatch_control", "active"),
+        "stopped_by_user": bool(run.get("stopped_by_user")),
         "started_at": started_at,
         "threads": int(run.get("threads", 0) or 0),
         "total_key_phrases": total,

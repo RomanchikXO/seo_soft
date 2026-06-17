@@ -1198,6 +1198,7 @@ function describeTask(task) {
 }
 
 function armTask(task) {
+  if (task.paused || task.stopRequested) return;
   const delay = task.nextAt - Date.now();
   if (delay > MAX_TIMEOUT_MS) {
     task.timer = setTimeout(() => armTask(task), MAX_TIMEOUT_MS);
@@ -1230,6 +1231,10 @@ function scheduleTaskFromPlay() {
     statsExpanded: false,
     runId: null,
     timer: null,
+    paused: false,
+    pausedRemainingMs: null,
+    pauseOnRunId: false,
+    stopRequested: false,
     weekdays: [],
     time: "",
     nextAt: null,
@@ -1277,6 +1282,7 @@ function scheduleTaskFromPlay() {
 }
 
 async function runTask(task) {
+  if (task.paused || task.stopRequested) return;
   task.timer = null;
   task.status = "running";
   task.stats = null;
@@ -1287,11 +1293,29 @@ async function runTask(task) {
     const { summary: result } = await executeOptimization(task.cardIds, task.threads, (progress, runId) => {
       task.runId = runId;
       task.stats = progress;
+      if (progress.dispatch_control === "paused") {
+        task.paused = true;
+      } else if (progress.dispatch_control === "active") {
+        task.paused = false;
+      }
+      if (task.stopRequested && runId) {
+        api(`/api/optimization/stop/${runId}`, { method: "POST" }).catch(() => {});
+      }
+      if (task.pauseOnRunId && runId) {
+        task.pauseOnRunId = false;
+        api(`/api/optimization/pause/${runId}`, { method: "POST" })
+          .then(() => {
+            task.paused = true;
+            renderTasks();
+          })
+          .catch(() => {});
+      }
       if (task.statsExpanded) {
         renderTasks();
       }
     });
     const finishedAt = new Date().toLocaleTimeString("ru-RU");
+    const stoppedByUser = Boolean(result.stopped_by_user || task.stopRequested);
     task.status = "done";
     task.stats = task.stats && task.stats.status === "done" ? task.stats : {
       status: "done",
@@ -1332,10 +1356,16 @@ async function runTask(task) {
           }))
         : [],
     };
-    task.resultText =
-      `Готово в ${finishedAt}. Карточек: ${result.processed_cards}, ` +
-      `Поиск: ${result.total_search_performed}/${result.total_search_target}, ` +
-      `Карты: ${result.total_maps_performed}/${result.total_maps_target}.`;
+    task.resultText = stoppedByUser
+      ? `Остановлено в ${finishedAt}. Карточек: ${result.processed_cards}, ` +
+        `Поиск: ${result.total_search_performed}/${result.total_search_target}, ` +
+        `Карты: ${result.total_maps_performed}/${result.total_maps_target}.`
+      : `Готово в ${finishedAt}. Карточек: ${result.processed_cards}, ` +
+        `Поиск: ${result.total_search_performed}/${result.total_search_target}, ` +
+        `Карты: ${result.total_maps_performed}/${result.total_maps_target}.`;
+    task.paused = false;
+    task.stopRequested = false;
+    task.pausedRemainingMs = null;
   } catch (error) {
     task.status = "error";
     task.resultText = `Ошибка запуска: ${error.message}`;
@@ -1345,7 +1375,7 @@ async function runTask(task) {
     }
   }
 
-  if (task.type === "auto") {
+  if (task.type === "auto" && !task.stopRequested) {
     const nextAt = computeNextAutoRun(task.weekdays, task.time, Date.now());
     if (nextAt) {
       if (task.stats) {
@@ -1364,6 +1394,77 @@ async function runTask(task) {
   renderTasks();
   ensureCountdownTimer();
   ensureTaskStatsPollTimer();
+}
+
+function pauseTask(taskId) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task || task.paused || task.stopRequested) return;
+  if (task.status === "scheduled") {
+    if (task.timer) clearTimeout(task.timer);
+    task.timer = null;
+    task.pausedRemainingMs = Math.max(0, task.nextAt - Date.now());
+    task.paused = true;
+    renderTasks();
+    ensureCountdownTimer();
+    return;
+  }
+  if (task.status === "running") {
+    if (task.runId) {
+      api(`/api/optimization/pause/${task.runId}`, { method: "POST" })
+        .then(() => {
+          task.paused = true;
+          renderTasks();
+        })
+        .catch((error) => alert(`Не удалось поставить задачу на паузу: ${error.message}`));
+      return;
+    }
+    task.pauseOnRunId = true;
+    task.paused = true;
+    renderTasks();
+  }
+}
+
+function startTask(taskId) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task || !task.paused || task.stopRequested) return;
+  if (task.status === "scheduled") {
+    task.nextAt = Date.now() + (task.pausedRemainingMs || 0);
+    task.pausedRemainingMs = null;
+    task.paused = false;
+    armTask(task);
+    renderTasks();
+    ensureCountdownTimer();
+    return;
+  }
+  if (task.status === "running" && task.runId) {
+    api(`/api/optimization/resume/${task.runId}`, { method: "POST" })
+      .then(() => {
+        task.paused = false;
+        renderTasks();
+      })
+      .catch((error) => alert(`Не удалось возобновить задачу: ${error.message}`));
+  }
+}
+
+function stopTask(taskId) {
+  const task = state.tasks.find((item) => item.id === taskId);
+  if (!task || task.stopRequested) return;
+  task.stopRequested = true;
+  task.paused = false;
+  task.pausedRemainingMs = null;
+  if (task.status === "scheduled") {
+    if (task.timer) clearTimeout(task.timer);
+    task.timer = null;
+    cancelTask(taskId);
+    return;
+  }
+  if (task.status === "running" && task.runId) {
+    api(`/api/optimization/stop/${task.runId}`, { method: "POST" })
+      .then(() => renderTasks())
+      .catch((error) => alert(`Не удалось остановить задачу: ${error.message}`));
+    return;
+  }
+  renderTasks();
 }
 
 function cancelTask(taskId) {
@@ -1385,12 +1486,65 @@ function ensureCountdownTimer() {
   }
 }
 
+function getTaskCountdownMs(task) {
+  if (task.status !== "scheduled" || !task.nextAt) return 0;
+  if (task.paused && task.pausedRemainingMs != null) {
+    return task.pausedRemainingMs;
+  }
+  return task.nextAt - Date.now();
+}
+
 function tickCountdowns() {
   for (const task of state.tasks) {
-    if (task.status !== "scheduled" || !task.nextAt) continue;
+    if (task.status !== "scheduled" || !task.nextAt || task.paused) continue;
     const span = ui.optimizationTasksList.querySelector(`.task-countdown[data-task="${task.id}"]`);
     if (span) span.textContent = formatCountdown(task.nextAt - Date.now());
   }
+}
+
+function renderTaskControlButtons(task) {
+  const group = document.createElement("div");
+  group.className = "task-controls";
+
+  const showControls = task.status === "scheduled" || task.status === "running";
+  if (!showControls) {
+    return group;
+  }
+
+  const startBtn = document.createElement("button");
+  startBtn.type = "button";
+  startBtn.className = "btn task-control";
+  startBtn.textContent = "Старт";
+  startBtn.disabled = !task.paused || task.stopRequested;
+  startBtn.onclick = (event) => {
+    event.stopPropagation();
+    startTask(task.id);
+  };
+
+  const stopBtn = document.createElement("button");
+  stopBtn.type = "button";
+  stopBtn.className = "btn task-control";
+  stopBtn.textContent = "Стоп";
+  stopBtn.disabled = task.stopRequested;
+  stopBtn.onclick = (event) => {
+    event.stopPropagation();
+    stopTask(task.id);
+  };
+
+  const pauseBtn = document.createElement("button");
+  pauseBtn.type = "button";
+  pauseBtn.className = "btn task-control";
+  pauseBtn.textContent = "Пауза";
+  pauseBtn.disabled = task.paused || task.stopRequested;
+  pauseBtn.onclick = (event) => {
+    event.stopPropagation();
+    pauseTask(task.id);
+  };
+
+  group.appendChild(startBtn);
+  group.appendChild(stopBtn);
+  group.appendChild(pauseBtn);
+  return group;
 }
 
 function renderTasks() {
@@ -1398,7 +1552,7 @@ function renderTasks() {
   for (const task of state.tasks) {
     const displayStats = getTaskDisplayStats(task);
     const card = document.createElement("div");
-    card.className = `task-card ${task.status} task-card-clickable`;
+    card.className = `task-card ${task.status}${task.paused ? " paused" : ""} task-card-clickable`;
     card.onclick = () => toggleTaskStats(task.id);
     card.title = task.statsExpanded ? "Скрыть статистику" : "Показать статистику";
 
@@ -1412,6 +1566,8 @@ function renderTasks() {
     title.appendChild(dot);
     title.appendChild(document.createTextNode(describeTask(task)));
     row.appendChild(title);
+
+    row.appendChild(renderTaskControlButtons(task));
 
     const cancelBtn = document.createElement("button");
     cancelBtn.type = "button";
@@ -1429,15 +1585,22 @@ function renderTasks() {
     meta.className = "task-meta";
     if (task.status === "scheduled" && task.nextAt) {
       const when = new Date(task.nextAt).toLocaleString("ru-RU");
+      const pauseNote = task.paused ? " На паузе." : "";
       meta.innerHTML =
         `Карточек: ${task.cardIds.length}, потоки: ${task.threads}. ` +
         `Следующий запуск: <b>${when}</b> · ` +
-        `через <span class="task-countdown" data-task="${task.id}">${formatCountdown(task.nextAt - Date.now())}</span>`;
+        `через <span class="task-countdown" data-task="${task.id}">${formatCountdown(getTaskCountdownMs(task))}</span>` +
+        pauseNote;
       meta.innerHTML += task.statsExpanded
         ? " Статистика развёрнута."
         : " Нажмите, чтобы открыть статистику.";
     } else if (task.status === "running") {
-      meta.textContent = `Выполняется… Карточек: ${task.cardIds.length}, потоки: ${task.threads}.`;
+      const pauseNote = task.paused ? " На паузе — открытые окна дорабатывают." : "";
+      const stopNote = task.stopRequested ? " Останавливается — новые окна не открываются." : "";
+      meta.textContent =
+        `Выполняется… Карточек: ${task.cardIds.length}, потоки: ${task.threads}.` +
+        pauseNote +
+        stopNote;
       meta.textContent += task.statsExpanded
         ? " Статистика развёрнута."
         : " Нажмите, чтобы открыть статистику.";
