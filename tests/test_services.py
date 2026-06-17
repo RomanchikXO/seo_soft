@@ -8,7 +8,7 @@ import pytest
 
 from shagteampro.application.services.card_service import CardService
 from shagteampro.application.services.key_service import KeyService
-from shagteampro.application.services.notification_service import NotificationService
+from shagteampro.application.services.notification_service import NotificationService, TELEGRAM_MESSAGE_LIMIT
 from shagteampro.application.services.search_runner_service import SearchRunnerService
 from shagteampro.application.services.settings_service import SettingsService
 from shagteampro.application.services.yandex_organization_service import YandexOrganizationService
@@ -53,6 +53,39 @@ def _optimization_summary() -> dict[str, object]:
             },
         ],
     }
+
+
+def test_notify_optimization_splits_long_message_into_multiple_sends(tmp_path: Path) -> None:
+    repo = SqliteRepository(tmp_path / "svc.db")
+    settings = SettingsService(repo)
+    settings.save_settings({"telegram_token": "token-123", "telegram_chat_id": "111"})
+    notifier = _FakeNotifier()
+    service = NotificationService(settings, notifier=notifier)
+
+    exhausted = [
+        {
+            "key_id": index,
+            "phrase": f"ключ-{index}",
+            "mode": "search",
+            "failures": 50,
+            "card_name": f"Org {index}",
+        }
+        for index in range(1, 121)
+    ]
+    summary = {
+        "processed_cards": 1,
+        "total_search_target": 0,
+        "total_search_performed": 0,
+        "total_maps_target": 0,
+        "total_maps_performed": 0,
+        "key_failure_reports": exhausted,
+        "cards": [],
+    }
+
+    sent = service.notify_optimization_finished(summary, background=False)
+    assert sent is True
+    assert len(notifier.sent) > 1
+    assert all(len(entry[2]) <= TELEGRAM_MESSAGE_LIMIT for entry in notifier.sent)
 
 
 def test_card_service_validation_and_duplicate(tmp_path: Path) -> None:
@@ -250,9 +283,12 @@ def test_consume_action_result_counts_failure_only_when_requested() -> None:
         "card_id": 4,
         "mode": "search",
         "target": 3,
+        "card_payload": {"card_name": "Card", "organization": "Org"},
         "active_keys": [{"id": 1, "phrase": "test"}],
         "performed": 0,
         "failures": 0,
+        "key_failures": {},
+        "exhausted_key_records": [],
         "in_flight": 1,
         "effect_key_ids": set(),
         "action_counts": {},
@@ -279,6 +315,7 @@ def test_consume_action_result_counts_failure_only_when_requested() -> None:
         _Future({"effect": False, "actions": {}, "count_failure": True}),
     )
     assert state["failures"] == 1
+    assert state["key_failures"] == {1: 1}
 
 
 def test_apply_target_state_does_not_double_count_maps_clicks() -> None:
@@ -297,6 +334,150 @@ def test_apply_target_state_does_not_double_count_maps_clicks() -> None:
     # Повторный вызов при обновлении прогресса не должен раздувать счётчики.
     service._apply_target_state(card_entry, state)
     assert card_entry["maps_action_counts"] == {"Показать телефон": 1, "Сайт": 1}
+
+
+def test_notification_renders_key_failures_and_splits_long_messages() -> None:
+    reports = [
+        {
+            "key_id": index,
+            "phrase": f"ключ-{index}",
+            "mode": "search" if index % 2 else "maps",
+            "failures": 1 if index % 2 else SearchRunnerService.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY,
+            "card_name": f"Org {index}",
+        }
+        for index in range(1, 121)
+    ]
+    summary = {
+        "processed_cards": 1,
+        "total_search_target": 0,
+        "total_search_performed": 0,
+        "total_maps_target": 0,
+        "total_maps_performed": 0,
+        "total_failed_attempts": sum(item["failures"] for item in reports),
+        "key_failure_reports": reports,
+        "cards": [],
+    }
+    text = NotificationService.build_optimization_message(summary)
+    assert "Неудачи по ключам" in text
+    assert "Org 1" in text
+    assert "ключ-1" in text
+    assert "1</b> неудач" in text
+    assert "50</b> неудач" in text
+
+    chunks = NotificationService.split_message_for_telegram(text)
+    assert len(chunks) > 1
+    assert all(len(chunk) <= TELEGRAM_MESSAGE_LIMIT for chunk in chunks)
+
+
+def test_notification_renders_single_key_failure() -> None:
+    summary = {
+        "processed_cards": 1,
+        "total_search_target": 1,
+        "total_search_performed": 0,
+        "total_maps_target": 0,
+        "total_maps_performed": 0,
+        "key_failure_reports": [
+            {
+                "key_id": 10,
+                "phrase": "каракилис запрос",
+                "mode": "search",
+                "failures": 1,
+                "card_name": "Каракилис",
+            }
+        ],
+        "cards": [
+            {
+                "card_id": 1,
+                "organization": "Каракилис",
+                "search_target": 1,
+                "search_performed": 0,
+                "maps_target": 0,
+                "maps_performed": 0,
+            }
+        ],
+    }
+    text = NotificationService.build_optimization_message(summary)
+    assert "Неудачи по ключам" in text
+    assert "Каракилис" in text
+    assert "каракилис запрос" in text
+    assert "поиск" in text
+    assert "1</b> неудач" in text
+
+
+def test_merge_key_failure_reports_keeps_search_and_maps_separately() -> None:
+    service = SearchRunnerService()
+    card_entry: dict[str, object] = {"key_failure_reports": []}
+    card_payload = {
+        "card_name": "Каракилис",
+        "organization": "Каракилис",
+        "keys": [
+            {"id": 10, "phrase": "ключ поиск"},
+            {"id": 20, "phrase": "ключ карты"},
+        ],
+    }
+    service._merge_key_failure_reports(
+        card_entry,
+        {
+            "mode": "search",
+            "card_payload": card_payload,
+            "key_failures": {10: 1},
+        },
+    )
+    service._merge_key_failure_reports(
+        card_entry,
+        {
+            "mode": "maps",
+            "card_payload": card_payload,
+            "key_failures": {20: 2},
+        },
+    )
+    assert card_entry["key_failure_reports"] == [
+        {
+            "key_id": 10,
+            "phrase": "ключ поиск",
+            "mode": "search",
+            "failures": 1,
+            "card_name": "Каракилис",
+        },
+        {
+            "key_id": 20,
+            "phrase": "ключ карты",
+            "mode": "maps",
+            "failures": 2,
+            "card_name": "Каракилис",
+        },
+    ]
+
+
+def test_attempts_reserved_counts_success_failures_and_in_flight() -> None:
+    state = {"performed": 2, "failures": 3, "in_flight": 1, "target": 10, "active_keys": [{}]}
+    assert SearchRunnerService._attempts_reserved(state) == 6
+    assert SearchRunnerService._pick_dispatchable_target([state]) is state
+    state["failures"] = 7
+    assert SearchRunnerService._pick_dispatchable_target([state]) is None
+
+
+def test_increment_key_failure_removes_key_at_limit() -> None:
+    service = SearchRunnerService()
+    state: dict[str, object] = {
+        "mode": "maps",
+        "card_payload": {"card_name": "Card", "organization": "Org"},
+        "active_keys": [{"id": 5, "phrase": "query"}],
+        "failures": 0,
+        "key_failures": {},
+        "exhausted_key_records": [],
+    }
+    key_payload = {"id": 5, "phrase": "query"}
+
+    for _ in range(SearchRunnerService.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY - 1):
+        count = service._increment_key_failure(state, key_payload)
+        assert count < SearchRunnerService.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY
+        assert state["active_keys"]
+
+    final_count = service._increment_key_failure(state, key_payload)
+    assert final_count == SearchRunnerService.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY
+    assert state["active_keys"] == []
+    assert len(state["exhausted_key_records"]) == 1
 
 
 def test_notification_renders_target_action_totals() -> None:
@@ -956,16 +1137,16 @@ def test_search_runner_optimization_runs_search_and_maps_for_same_card(
     assert result["cards"][0]["maps_effect_keys"] == [10]
 
 
-def test_search_runner_retries_single_key_until_failure_budget(
+def test_search_runner_retries_single_key_until_transition_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = SearchRunnerService()
     monkeypatch.setattr(service, "ensure_chromium_installed", lambda: False)
     calls: list[int] = []
 
-    def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]) -> bool:
+    def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]) -> dict[str, object]:
         calls.append(int(key_payload["id"]))
-        return False
+        return {"effect": False, "actions": {}, "count_failure": True}
 
     monkeypatch.setattr(service, "_simulate_search_action", fake_search)
 
@@ -984,6 +1165,17 @@ def test_search_runner_retries_single_key_until_failure_budget(
 
     assert len(calls) == 4
     assert result["total_search_performed"] == 0
+    assert result["total_failed_attempts"] == 4
+    assert result["exhausted_keys"] == []
+    assert result["key_failure_reports"] == [
+        {
+            "key_id": 10,
+            "phrase": "",
+            "mode": "search",
+            "failures": 4,
+            "card_name": "Card",
+        }
+    ]
 
 
 def test_is_browser_closed_error_detects_target_closed() -> None:
@@ -1066,17 +1258,16 @@ def test_search_runner_single_key_recovers_after_transient_failure(
     assert result["total_search_performed"] == 2
 
 
-def test_search_runner_drops_unproductive_key_when_alternatives_exist(
+def test_search_runner_exhausts_key_after_max_failed_attempts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service = SearchRunnerService()
     monkeypatch.setattr(service, "ensure_chromium_installed", lambda: False)
     calls: list[int] = []
 
-    def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]) -> bool:
-        key_id = int(key_payload["id"])
-        calls.append(key_id)
-        return key_id == 20
+    def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]) -> dict[str, object]:
+        calls.append(int(key_payload["id"]))
+        return {"effect": False, "actions": {}, "count_failure": True}
 
     monkeypatch.setattr(service, "_simulate_search_action", fake_search)
 
@@ -1085,7 +1276,59 @@ def test_search_runner_drops_unproductive_key_when_alternatives_exist(
             {
                 "card_id": 1,
                 "card_name": "Card",
-                "search_target": 2,
+                "organization": "Кофейня",
+                "search_target": 200,
+                "maps_target": 0,
+                "keys": [{"id": 10, "phrase": "кофе", "search_enabled": True, "maps_enabled": False}],
+            }
+        ],
+        threads=1,
+    )
+
+    assert len(calls) == SearchRunnerService.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY
+    assert result["total_search_performed"] == 0
+    assert result["total_failed_attempts"] == SearchRunnerService.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY
+    assert result["exhausted_keys"] == [
+        {
+            "key_id": 10,
+            "phrase": "кофе",
+            "mode": "search",
+            "failures": SearchRunnerService.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY,
+            "card_name": "Кофейня",
+        }
+    ]
+    assert result["key_failure_reports"] == result["exhausted_keys"]
+
+
+def test_search_runner_keeps_random_rotation_with_multiple_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SearchRunnerService()
+    monkeypatch.setattr(service, "ensure_chromium_installed", lambda: False)
+    calls: list[int] = []
+    round_robin = {"step": 0}
+
+    def fake_choice(keys: list[dict[str, object]]) -> dict[str, object]:
+        picked = keys[round_robin["step"] % len(keys)]
+        round_robin["step"] += 1
+        return picked
+
+    def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]):
+        key_id = int(key_payload["id"])
+        calls.append(key_id)
+        if key_id == 20:
+            return True
+        return {"effect": False, "actions": {}, "count_failure": True}
+
+    monkeypatch.setattr("shagteampro.application.services.search_runner_service.random.choice", fake_choice)
+    monkeypatch.setattr(service, "_simulate_search_action", fake_search)
+
+    result = service.run_cards_optimization(
+        cards=[
+            {
+                "card_id": 1,
+                "card_name": "Card",
+                "search_target": 10,
                 "maps_target": 0,
                 "keys": [
                     {"id": 10, "search_enabled": True, "maps_enabled": False},
@@ -1096,8 +1339,73 @@ def test_search_runner_drops_unproductive_key_when_alternatives_exist(
         threads=1,
     )
 
-    assert result["total_search_performed"] == 2
+    assert result["total_search_performed"] == 5
+    assert result["total_failed_attempts"] == 5
     assert result["cards"][0]["search_effect_keys"] == [20]
+    assert 10 in calls
+    assert 20 in calls
+    assert len(calls) == 10
+
+
+def test_simulate_search_action_counts_missing_org_block_as_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SearchRunnerService()
+
+    class _DummyPage:
+        def goto(self, *_args, **_kwargs) -> None:
+            return
+
+        def wait_for_timeout(self, *_args, **_kwargs) -> None:
+            return
+
+    class _DummyContext:
+        def new_page(self):
+            return _DummyPage()
+
+    class _DummyBrowser:
+        def close(self) -> None:
+            return
+
+    class _DummyPlaywright:
+        def start(self):
+            return self
+
+    class _CaptchaResolution:
+        detected = False
+        solved = False
+
+    monkeypatch.setattr(service, "_prepare_runtime_browsers_path", lambda: Path("/tmp/pw"))
+    monkeypatch.setattr(
+        service,
+        "_launch_chromium_with_recovery",
+        lambda *_args, **_kwargs: (_DummyBrowser(), _DummyContext()),
+    )
+    monkeypatch.setattr(service, "_open_browser_page", lambda _context: _DummyPage())
+    monkeypatch.setattr(service, "_get_search_input", lambda _page: object())
+    monkeypatch.setattr(service, "_type_query_and_submit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        service,
+        "_handle_captcha_if_present",
+        lambda *_args, **_kwargs: _CaptchaResolution(),
+    )
+    monkeypatch.setattr(service, "_captcha_blocks_progress", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(service, "_dismiss_distribution_modal", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "_open_large_map", lambda _page: False)
+    monkeypatch.setattr(service, "_close_browser_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service, "_stop_playwright_instance", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "shagteampro.application.services.search_runner_service.sync_playwright",
+        lambda: _DummyPlaywright(),
+        raising=False,
+    )
+
+    result = service._simulate_search_action(
+        key_payload={"phrase": "кофейня"},
+        card_payload={"city": "Москва", "street": "", "organization": "Кофейня"},
+    )
+
+    assert result == {"effect": False, "actions": {}, "count_failure": True}
 
 
 def test_search_runner_maps_mode_uses_card_activity_settings(

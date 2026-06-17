@@ -20,6 +20,8 @@ PROXY_PATTERN = re.compile(
     r":\d{1,5}/?$"  # :port
 )
 
+TELEGRAM_MESSAGE_LIMIT = 4096
+
 
 class NotificationService:
     """Готовит и отправляет уведомления о результатах работы приложения в Telegram.
@@ -73,10 +75,14 @@ class NotificationService:
         return self._send_to_all(token, chat_ids, text, proxy)
 
     def _send_to_all(self, token: str, chat_ids: list[str], text: str, proxy: str) -> bool:
-        """Отправляет одно сообщение всем получателям. True, если хотя бы один успех."""
+        """Отправляет сообщение (или несколько частей) всем получателям. True, если хотя бы один успех."""
+        chunks = self.split_message_for_telegram(text)
         any_sent = False
         for chat_id in chat_ids:
-            if self._notifier.send_message(token, chat_id, text, proxy):
+            chat_sent = all(
+                self._notifier.send_message(token, chat_id, chunk, proxy) for chunk in chunks
+            )
+            if chat_sent:
                 any_sent = True
             else:
                 self._log(f"NotificationService: не удалось отправить уведомление для chat_id '{chat_id}'.")
@@ -161,6 +167,7 @@ class NotificationService:
         maps_lines = NotificationService._build_mode_lines(typed_cards, mode="maps", label="карты")
         action_lines = NotificationService._build_action_total_lines(typed_action_totals)
         failed_lines = NotificationService._build_failed_lines(typed_cards)
+        key_failure_lines = NotificationService._build_key_failure_lines(summary)
 
         if action_lines:
             lines.append("")
@@ -187,7 +194,44 @@ class NotificationService:
             lines.append("<b>⚠️ Не удалось выполнить:</b>")
             lines.extend(failed_lines)
 
+        if key_failure_lines:
+            lines.append("")
+            lines.append("<b>⚠️ Неудачи по ключам:</b>")
+            lines.extend(key_failure_lines)
+
         return "\n".join(lines)
+
+    @staticmethod
+    def split_message_for_telegram(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+        """Разбивает текст на части, не превышающие лимит длины сообщения Telegram."""
+        if len(text) <= limit:
+            return [text]
+
+        chunks: list[str] = []
+        current_lines: list[str] = []
+        current_length = 0
+
+        for line in text.split("\n"):
+            prefix = 1 if current_lines else 0
+            projected = current_length + prefix + len(line)
+            if current_lines and projected > limit:
+                chunks.append("\n".join(current_lines))
+                current_lines = [line]
+                current_length = len(line)
+                continue
+            if len(line) > limit:
+                if current_lines:
+                    chunks.append("\n".join(current_lines))
+                    current_lines = []
+                    current_length = 0
+                chunks.extend(line[index : index + limit] for index in range(0, len(line), limit))
+                continue
+            current_lines.append(line)
+            current_length = projected
+
+        if current_lines:
+            chunks.append("\n".join(current_lines))
+        return chunks or [text[:limit]]
 
     @staticmethod
     def _percent_suffix(done: int, target: int) -> str:
@@ -385,6 +429,35 @@ class NotificationService:
                 failed_parts.append(f"карты {maps_failed}")
             lines.append(f"• <b>{title}</b>: {', '.join(failed_parts)} (всего {total_failed})")
         return lines
+
+    @staticmethod
+    def _mode_label(mode: object) -> str:
+        """Возвращает подпись режима для отчёта."""
+        if mode == "search":
+            return "поиск"
+        if mode == "maps":
+            return "карты"
+        return html.escape(str(mode or ""))
+
+    @staticmethod
+    def _build_key_failure_lines(summary: dict[str, object]) -> list[str]:
+        """Формирует строки отчёта по ключам с хотя бы одной неудачной попыткой."""
+        reports = summary.get("key_failure_reports")
+        if not isinstance(reports, list) or not reports:
+            reports = summary.get("exhausted_keys", [])
+        if not isinstance(reports, list):
+            return []
+
+        return [
+            (
+                f"• <b>{html.escape(str(entry.get('card_name') or 'Без названия'))}</b> · "
+                f"{html.escape(str(entry.get('phrase') or entry.get('key_id') or ''))} · "
+                f"{NotificationService._mode_label(entry.get('mode'))} · "
+                f"<b>{int(entry.get('failures', 0) or 0)}</b> неудач"
+            )
+            for entry in reports
+            if isinstance(entry, dict) and int(entry.get("failures", 0) or 0) > 0
+        ]
 
     @staticmethod
     def _default_log(message: str) -> None:

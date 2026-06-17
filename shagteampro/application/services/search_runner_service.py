@@ -101,6 +101,7 @@ class _ActionBudget:
 
 
 _PLAYWRIGHT_ACTION_TIMEOUT_MS = 5_000
+_DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY = 50
 _CHROME_IGNORED_DEFAULT_ARGS = (
     "--enable-automation",
     "--no-sandbox",
@@ -110,6 +111,7 @@ _CHROME_IGNORED_DEFAULT_ARGS = (
 class SearchRunnerService:
     """Сервис, который управляет Playwright-браузером и имитирует действия пользователя."""
 
+    DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY = _DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY
     SEARCH_INPUT_XPATH = "/html/body/main/div[2]/form/div[4]/div/div[2]/div/textarea[1]"
     SEARCH_INPUT_CSS = "textarea#text.search3__input, textarea#text, textarea.search3__input"
     FORCED_USER_AGENT = (
@@ -315,6 +317,10 @@ class SearchRunnerService:
             "maps_performed": 0,
             "maps_effect_keys": [],
             "maps_action_counts": {},
+            "search_failures": 0,
+            "maps_failures": 0,
+            "exhausted_keys": [],
+            "key_failure_reports": [],
         }
 
     def _build_target_states(self, prepared_cards: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -348,6 +354,8 @@ class SearchRunnerService:
                         "active_keys": list(keys),
                         "performed": 0,
                         "failures": 0,
+                        "key_failures": {},
+                        "exhausted_key_records": [],
                         "in_flight": 0,
                         "effect_key_ids": set(),
                         "action_counts": {},
@@ -449,12 +457,21 @@ class SearchRunnerService:
             )
 
     @staticmethod
+    def _attempts_reserved(state: dict[str, object]) -> int:
+        """Возвращает число уже занятых попыток: успешные, неудачные и выполняющиеся."""
+        return (
+            int(state.get("performed", 0) or 0)
+            + int(state.get("failures", 0) or 0)
+            + int(state.get("in_flight", 0) or 0)
+        )
+
+    @staticmethod
     def _pick_dispatchable_target(targets: list[dict[str, object]]) -> dict[str, object] | None:
         """Выбирает цель, которой еще нужны действия и есть свободный «бюджет» на отправку."""
         for state in targets:
             if not state["active_keys"]:
                 continue
-            if state["performed"] + state["in_flight"] >= state["target"]:
+            if SearchRunnerService._attempts_reserved(state) >= int(state["target"]):
                 continue
             return state
         return None
@@ -503,39 +520,69 @@ class SearchRunnerService:
                 f"(транзитная ошибка), повторю без увеличения счётчика неудач."
             )
 
+    def _increment_key_failure(
+        self,
+        state: dict[str, object],
+        key_payload: dict[str, object],
+    ) -> int:
+        """Увеличивает счётчики неудач по режиму и ключу; при лимите убирает ключ из ротации."""
+        state["failures"] = int(state.get("failures", 0) or 0) + 1
+        key_id = int(key_payload.get("id", 0) or 0)
+        if not key_id:
+            return 0
+
+        key_failures = state.setdefault("key_failures", {})
+        key_failures[key_id] = int(key_failures.get(key_id, 0) or 0) + 1
+        failures_for_key = key_failures[key_id]
+        if failures_for_key < self.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY:
+            return failures_for_key
+
+        state["active_keys"] = [
+            key for key in state["active_keys"] if int(key.get("id", 0) or 0) != key_id
+        ]
+        card_payload = state["card_payload"]
+        state.setdefault("exhausted_key_records", []).append(
+            {
+                "key_id": key_id,
+                "phrase": str(key_payload.get("phrase", "")),
+                "mode": state["mode"],
+                "failures": failures_for_key,
+                "card_name": str(
+                    card_payload.get("organization") or card_payload.get("card_name") or ""
+                ),
+            }
+        )
+        return failures_for_key
+
     def _handle_failed_action(
         self,
         state: dict[str, object],
         key_payload: dict[str, object],
     ) -> None:
-        """Обрабатывает провал: организация не найдена в списке после открытия карты/выдачи.
+        """Обрабатывает провал: организация не найдена в списке или на выдаче нет блока организаций.
 
-        Если у цели есть другие ключи, текущий считается непродуктивным и
-        убирается. Если ключ единственный, попытка повторяется до исчерпания
-        бюджета в `target` неудач — это защищает от зацикливания, но не обнуляет
-        цель после первой же ошибки.
-
-        Транзитные сбои (капча, пустая выдача, таймаут и т.п.) сюда не попадают.
+        Ключ остаётся в ротации до ``DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY`` неудач
+        или пока не исчерпан общий бюджет попыток режима (``target``). Транзитные
+        сбои (капча, таймаут до отправки запроса и т.п.) сюда не попадают.
         """
-        state["failures"] += 1
+        failures_for_key = self._increment_key_failure(state, key_payload)
         card_id = state["card_id"]
         mode = state["mode"]
+        key_id = int(key_payload.get("id", 0) or 0)
+        attempts_used = int(state.get("failures", 0) or 0) + int(state.get("performed", 0) or 0)
+        target = int(state["target"])
 
-        if len(state["active_keys"]) > 1:
-            state["active_keys"].remove(key_payload)
-            return
-
-        if state["failures"] >= state["target"]:
-            state["active_keys"].clear()
+        if failures_for_key >= self.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY:
             self._log(
-                f"Карточка #{card_id}: {mode} — исчерпан лимит неудачных попыток "
-                f"({state['failures']}/{state['target']}), останавливаю."
+                f"Карточка #{card_id}: {mode} — ключ #{key_id} исчерпал лимит неудач "
+                f"({failures_for_key}/{self.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY}), убираю из ротации."
             )
             return
 
         self._log(
-            f"Карточка #{card_id}: {mode} — неудачная попытка "
-            f"{state['failures']}/{state['target']}, повторю с тем же ключом."
+            f"Карточка #{card_id}: {mode} — неудачная попытка по ключу #{key_id} "
+            f"{failures_for_key}/{self.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY}, "
+            f"общий бюджет {attempts_used}/{target}."
         )
 
     def _execute_single_action(
@@ -601,6 +648,41 @@ class SearchRunnerService:
         key_payloads = card_payload.get("keys", [])
         return key_payloads if isinstance(key_payloads, list) else []
 
+    @staticmethod
+    def _merge_key_failure_reports(
+        card_entry: dict[str, object],
+        state: dict[str, object],
+    ) -> None:
+        """Сохраняет итоговые неудачи по каждому ключу режима для отчёта."""
+        key_failures = state.get("key_failures")
+        if not isinstance(key_failures, dict) or not key_failures:
+            return
+
+        mode = state["mode"]
+        card_payload = state["card_payload"]
+        card_name = str(card_payload.get("organization") or card_payload.get("card_name") or "")
+        keys_by_id = {
+            int(key.get("id", 0) or 0): key
+            for key in SearchRunnerService._card_key_payloads(card_payload)
+            if int(key.get("id", 0) or 0)
+        }
+        preserved = [
+            report
+            for report in (card_entry.get("key_failure_reports") or [])
+            if isinstance(report, dict) and report.get("mode") != mode
+        ]
+        card_entry["key_failure_reports"] = preserved + [
+            {
+                "key_id": key_id,
+                "phrase": str(keys_by_id.get(key_id, {}).get("phrase", "")),
+                "mode": mode,
+                "failures": int(count or 0),
+                "card_name": card_name,
+            }
+            for key_id, count in key_failures.items()
+            if int(count or 0) > 0
+        ]
+
     def _apply_target_state(
         self,
         card_entry: dict[str, object],
@@ -609,7 +691,17 @@ class SearchRunnerService:
         """Записывает итог выполненной search/maps цели в строку карточки."""
         mode = state["mode"]
         card_entry[f"{mode}_performed"] = int(state["performed"])
+        card_entry[f"{mode}_failures"] = int(state.get("failures", 0) or 0)
         card_entry[f"{mode}_effect_keys"] = sorted(state["effect_key_ids"])
+        self._merge_key_failure_reports(card_entry, state)
+        exhausted_records = state.get("exhausted_key_records")
+        if isinstance(exhausted_records, list):
+            preserved = [
+                record
+                for record in (card_entry.get("exhausted_keys") or [])
+                if isinstance(record, dict) and record.get("mode") != mode
+            ]
+            card_entry["exhausted_keys"] = preserved + list(exhausted_records)
         if mode == "maps":
             # state["action_counts"] уже накопительный итог по цели maps — не суммируем повторно.
             card_entry["maps_action_counts"] = dict(state.get("action_counts", {}))
@@ -634,10 +726,26 @@ class SearchRunnerService:
             for action_label, count in action_counts.items():
                 total_action_counts[action_label] = total_action_counts.get(action_label, 0) + int(count)
 
+        key_failure_reports = [
+            report
+            for item in results
+            for report in (item.get("key_failure_reports") or [])
+            if isinstance(report, dict)
+        ]
+        exhausted_keys = [
+            report
+            for report in key_failure_reports
+            if int(report.get("failures", 0) or 0) >= self.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY
+        ]
+        total_failed_attempts = sum(
+            int(item.get("search_failures", 0) or 0) + int(item.get("maps_failures", 0) or 0)
+            for item in results
+        )
+
         self._log(
             f"Оптимизация завершена. search={totals['search_performed']}/{totals['search_target']}, "
             f"maps={totals['maps_performed']}/{totals['maps_target']}, "
-            f"действия={total_action_counts}"
+            f"неудач={total_failed_attempts}, действия={total_action_counts}"
         )
         return {
             "processed_cards": len(results),
@@ -645,7 +753,10 @@ class SearchRunnerService:
             "total_search_performed": totals["search_performed"],
             "total_maps_target": totals["maps_target"],
             "total_maps_performed": totals["maps_performed"],
+            "total_failed_attempts": total_failed_attempts,
             "total_action_counts": total_action_counts,
+            "key_failure_reports": key_failure_reports,
+            "exhausted_keys": exhausted_keys,
             "cards": results,
         }
 
@@ -677,7 +788,7 @@ class SearchRunnerService:
         effect = False
         force_fast_close = False
         browser_closed_externally = False
-        reached_org_list = False
+        search_results_reached = False
         step_label = "init"
         try:
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -713,6 +824,7 @@ class SearchRunnerService:
             if not resolution.detected or resolution.solved:
                 self._dismiss_distribution_modal(page, context=label)
 
+            search_results_reached = True
             step_label = "открытие большой карты"
             if not self._open_large_map(page):
                 self._log(
@@ -721,7 +833,6 @@ class SearchRunnerService:
                 )
                 force_fast_close = True
             else:
-                reached_org_list = True
                 step_label = "поиск организации в списке"
                 if self._find_and_open_organization(
                     page,
@@ -783,7 +894,7 @@ class SearchRunnerService:
         return {
             "effect": False,
             "actions": {},
-            "count_failure": reached_org_list,
+            "count_failure": search_results_reached,
         }
 
     _DISTRIBUTION_CLOSE_SELECTORS: tuple[str, ...] = (
