@@ -115,17 +115,7 @@ body.card-delete-mode #optimizationSelectAllBtn {
   opacity: 0.42;
 }
 body.card-delete-mode .card-item {
-  pointer-events: none;
-  cursor: default;
-}
-body.card-delete-mode .card-delete-toggle {
-  pointer-events: auto;
   cursor: pointer;
-}
-.card-delete-toggle input:checked + .card-opt-box {
-  border-color: #e05555;
-  background: linear-gradient(180deg, #e05555, #a82828);
-  box-shadow: 0 0 0 2px rgba(224, 85, 85, 0.22), inset 0 1px 1px rgba(255, 255, 255, 0.2);
 }
 .cards-list {
   flex: 1;
@@ -153,75 +143,34 @@ body.card-delete-mode .card-delete-toggle {
   font: inherit;
   line-height: 1.25;
   text-align: left;
-}
-.card-item-row {
-  width: 100%;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-height: 18px;
-}
-.card-item-checkbox-slot {
-  width: 18px;
-  flex-shrink: 0;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-.card-item-checkbox-slot:empty {
-  display: none;
+  transition: border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
 }
 .card-item.active {
   background: #2a2a2a;
   color: #ffffff;
   border-color: #7a7a7a;
 }
+.card-item.selected-delete {
+  border-color: #c43c3c;
+  background: #2a1515;
+  box-shadow:
+    0 0 6px rgba(220, 60, 60, 0.4),
+    0 0 16px rgba(200, 40, 40, 0.28),
+    inset 0 0 10px rgba(180, 30, 30, 0.1);
+}
+.card-item.selected-optimization {
+  border-color: #2fbf68;
+  background: #152818;
+  box-shadow:
+    0 0 6px rgba(47, 191, 104, 0.4),
+    0 0 16px rgba(47, 191, 104, 0.28),
+    inset 0 0 10px rgba(47, 191, 104, 0.1);
+}
 .card-item-name {
   flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.card-opt-toggle {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-}
-.card-opt-toggle input {
-  position: absolute;
-  opacity: 0;
-  pointer-events: none;
-}
-.card-opt-box {
-  width: 18px;
-  height: 18px;
-  border: 1px solid #646464;
-  border-radius: 6px;
-  background: linear-gradient(180deg, #171717, #111111);
-  box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.08), 0 0 0 1px rgba(0, 0, 0, 0.35);
-  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
-}
-.card-opt-box::after {
-  content: "";
-  position: absolute;
-  width: 5px;
-  height: 10px;
-  border-right: 2px solid #ffffff;
-  border-bottom: 2px solid #ffffff;
-  transform: rotate(45deg) scale(0.8);
-  opacity: 0;
-  transition: opacity 140ms ease, transform 140ms ease;
-}
-.card-opt-toggle input:checked + .card-opt-box {
-  border-color: #39b66d;
-  background: linear-gradient(180deg, #2fbf68, #1f8f4a);
-  box-shadow: 0 0 0 2px rgba(47, 191, 104, 0.18), inset 0 1px 1px rgba(255, 255, 255, 0.2);
-}
-.card-opt-toggle input:checked + .card-opt-box::after {
-  opacity: 1;
-  transform: rotate(45deg) scale(1);
 }
 .optimization-controls {
   display: flex;

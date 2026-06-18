@@ -274,73 +274,61 @@ async function loadCards() {
   refreshCardDeleteUi();
 }
 
-function createCardCheckbox(card, mode) {
-  const isDeleteMode = mode === "delete";
-  const selectedIds = isDeleteMode ? state.cardDeleteSelectedIds : state.optimizationSelectedCardIds;
+function toggleCardDeleteSelection(cardId) {
+  if (state.cardDeleteSelectedIds.has(cardId)) {
+    state.cardDeleteSelectedIds.delete(cardId);
+  } else {
+    state.cardDeleteSelectedIds.add(cardId);
+  }
+  renderCards();
+  refreshCardDeleteUi();
+}
 
-  const toggleLabel = document.createElement("label");
-  toggleLabel.className = isDeleteMode ? "card-opt-toggle card-delete-toggle" : "card-opt-toggle";
-  toggleLabel.title = isDeleteMode ? "Выбрать для удаления" : "Выбрать карточку для оптимизации";
-  toggleLabel.onclick = (event) => event.stopPropagation();
+function toggleCardOptimizationSelection(cardId) {
+  if (state.optimizationSelectedCardIds.has(cardId)) {
+    state.optimizationSelectedCardIds.delete(cardId);
+  } else {
+    state.optimizationSelectedCardIds.add(cardId);
+  }
+  renderCards();
+  refreshOptimizationStatus();
+}
 
-  const checkbox = document.createElement("input");
-  checkbox.type = "checkbox";
-  checkbox.checked = selectedIds.has(card.id);
-  checkbox.setAttribute(
-    "aria-label",
-    isDeleteMode ? `Выбрать для удаления ${card.name}` : `Выбрать карточку ${card.name}`
-  );
-  checkbox.onclick = (event) => event.stopPropagation();
-  checkbox.onchange = (event) => {
-    event.stopPropagation();
-    if (checkbox.checked) {
-      selectedIds.add(card.id);
-    } else {
-      selectedIds.delete(card.id);
-    }
-    if (isDeleteMode) {
-      refreshCardDeleteUi();
-    } else {
-      refreshOptimizationStatus();
-    }
-  };
-
-  const checkboxView = document.createElement("span");
-  checkboxView.className = "card-opt-box";
-
-  toggleLabel.appendChild(checkbox);
-  toggleLabel.appendChild(checkboxView);
-  return toggleLabel;
+function handleCardClick(card) {
+  if (state.cardDeleteMode) {
+    toggleCardDeleteSelection(card.id);
+    return;
+  }
+  if (state.activeTab === "optimization") {
+    toggleCardOptimizationSelection(card.id);
+    return;
+  }
+  selectCard(card.id, card.name);
 }
 
 function renderCards() {
   ui.cardsList.innerHTML = "";
-  const showCheckboxes = state.cardDeleteMode || state.activeTab === "optimization";
   for (const card of state.cards) {
     const item = document.createElement("div");
-    item.className = `card-item ${state.selectedCardId === card.id ? "active" : ""}`;
-
-    const row = document.createElement("div");
-    row.className = "card-item-row";
-
-    const checkboxSlot = document.createElement("div");
-    checkboxSlot.className = "card-item-checkbox-slot";
-    if (showCheckboxes) {
-      const checkboxMode = state.cardDeleteMode ? "delete" : "optimization";
-      checkboxSlot.appendChild(createCardCheckbox(card, checkboxMode));
+    const classes = ["card-item"];
+    const isViewMode = !state.cardDeleteMode && state.activeTab !== "optimization";
+    if (isViewMode && state.selectedCardId === card.id) {
+      classes.push("active");
     }
-    row.appendChild(checkboxSlot);
+    if (state.cardDeleteMode && state.cardDeleteSelectedIds.has(card.id)) {
+      classes.push("selected-delete");
+    }
+    if (!state.cardDeleteMode && state.optimizationSelectedCardIds.has(card.id)) {
+      classes.push("selected-optimization");
+    }
+    item.className = classes.join(" ");
 
     const name = document.createElement("span");
     name.className = "card-item-name";
     name.textContent = card.name;
-    row.appendChild(name);
+    item.appendChild(name);
 
-    item.appendChild(row);
-
-    if (!state.cardDeleteMode) {
-      item.onclick = () => selectCard(card.id, card.name);
-    }
+    item.onclick = () => handleCardClick(card);
     ui.cardsList.appendChild(item);
   }
 }
@@ -637,7 +625,7 @@ function refreshOptimizationStatus() {
 
   const allSelected =
     state.cards.length > 0 && state.cards.every((card) => state.optimizationSelectedCardIds.has(card.id));
-  ui.optimizationSelectAllBtn.textContent = allSelected ? "Снять все" : "Выбрать все";
+  ui.optimizationSelectAllBtn.textContent = allSelected ? "Отменить все" : "Выбрать все";
   ui.optimizationSelectAllBtn.disabled = state.cards.length === 0;
 
   if (state.activeTab !== "optimization") {
@@ -1356,6 +1344,9 @@ function scheduleTaskFromPlay() {
   }
 
   state.tasks.push(task);
+  state.optimizationSelectedCardIds.clear();
+  renderCards();
+  refreshOptimizationStatus();
   armTask(task);
   renderTasks();
   ensureCountdownTimer();
