@@ -24,7 +24,10 @@ from shagteampro.application.services.optimization_progress import (
     request_stop_run,
     resume_run,
 )
-from shagteampro.application.services.search_runner_service import SearchRunnerService
+from shagteampro.application.services.search_runner_service import (
+    SearchRunnerService,
+    cleanup_registered_user_data_dirs,
+)
 from shagteampro.application.services.settings_service import SettingsService
 from shagteampro.application.services.yandex_organization_service import YandexOrganizationService
 from shagteampro.infrastructure.importers.excel_importer import ExcelImporter
@@ -507,6 +510,7 @@ def create_app(base_dir: Path | None = None, services: AppServices | None = None
 
     @app.post("/api/shutdown")
     def shutdown(request: Request) -> dict[str, bool]:
+        cleanup_registered_user_data_dirs("shutdown", log=False)
         server = getattr(request.app.state, "uvicorn_server", None)
         if server is not None:
             server.should_exit = True

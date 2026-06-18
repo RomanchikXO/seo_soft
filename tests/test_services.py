@@ -9,7 +9,11 @@ import pytest
 from shagteampro.application.services.card_service import CardService
 from shagteampro.application.services.key_service import KeyService
 from shagteampro.application.services.notification_service import NotificationService, TELEGRAM_MESSAGE_LIMIT
-from shagteampro.application.services.search_runner_service import SearchRunnerService
+from shagteampro.application.services.search_runner_service import (
+    SearchRunnerService,
+    _register_user_data_dir,
+    cleanup_registered_user_data_dirs,
+)
 from shagteampro.application.services.settings_service import SettingsService
 from shagteampro.application.services.yandex_organization_service import YandexOrganizationService
 from shagteampro.infrastructure.parsers.yandex_organization_parser import YandexOrganizationParser
@@ -965,10 +969,12 @@ def test_remember_browser_pid_stores_subprocess_pid() -> None:
     assert browser._seo_soft_browser_pid == 9090
 
 
-def test_close_browser_session_skips_graceful_close_and_kills_process() -> None:
+def test_close_browser_session_skips_graceful_close_and_kills_process(tmp_path: Path) -> None:
     service = SearchRunnerService()
     closed_calls: list[str] = []
     killed: list[int] = []
+    profile_dir = tmp_path / "shagteampro-chrome-test"
+    profile_dir.mkdir()
 
     class _Proc:
         pid = 5151
@@ -984,6 +990,7 @@ def test_close_browser_session_skips_graceful_close_and_kills_process() -> None:
 
     class _Browser:
         _impl_obj = type("Impl", (), {"_browser_process": type("BP", (), {"process": _Proc()})()})()
+        _seo_soft_user_data_dir = str(profile_dir)
 
         def is_connected(self) -> bool:
             return True
@@ -991,9 +998,47 @@ def test_close_browser_session_skips_graceful_close_and_kills_process() -> None:
         def close(self) -> None:
             closed_calls.append("close")
 
-    service._close_browser_session(None, _Browser(), "test")
+    browser = _Browser()
+    service._close_browser_session(None, browser, "test")
     assert closed_calls == []
     assert killed == [5151]
+    assert not profile_dir.exists()
+    assert browser._seo_soft_user_data_dir is None
+
+
+def test_cleanup_registered_user_data_dirs_removes_tracked_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_dir = tmp_path / "shagteampro-chrome-tracked"
+    profile_dir.mkdir()
+    _register_user_data_dir(str(profile_dir))
+    monkeypatch.setattr(
+        "shagteampro.application.services.search_runner_service._kill_processes_for_user_data_dir",
+        lambda *_args, **_kwargs: None,
+    )
+
+    cleanup_registered_user_data_dirs("test")
+
+    assert not profile_dir.exists()
+
+
+def test_close_browser_session_removes_user_data_dir_on_skip_kill(tmp_path: Path) -> None:
+    service = SearchRunnerService()
+    profile_dir = tmp_path / "shagteampro-chrome-test"
+    profile_dir.mkdir()
+
+    class _Browser:
+        _seo_soft_browser_pid = 5151
+        _seo_soft_user_data_dir = str(profile_dir)
+
+        def is_connected(self) -> bool:
+            return False
+
+    browser = _Browser()
+    service._close_browser_session(None, browser, "test", skip_kill=True)
+    assert not profile_dir.exists()
+    assert browser._seo_soft_user_data_dir is None
 
 
 class _PhotoViewerPage:

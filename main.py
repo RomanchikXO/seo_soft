@@ -116,8 +116,12 @@ def _ensure_runtime_environment() -> None:
 
 
 def _prepare_browser_runtime() -> None:
-    from shagteampro.application.services.search_runner_service import SearchRunnerService
+    from shagteampro.application.services.search_runner_service import (
+        SearchRunnerService,
+        ensure_process_exit_cleanup,
+    )
 
+    ensure_process_exit_cleanup()
     print("Runtime initialization: checking Playwright Chromium...")
     installed_now = SearchRunnerService().ensure_chromium_installed()
     if installed_now:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import concurrent.futures
 import contextvars
 import datetime
@@ -49,6 +50,127 @@ def _get_run_logger() -> logging.Logger:
             logger.addHandler(handler)
             _run_logger = logger
     return _run_logger
+
+
+_active_user_data_dirs: set[str] = set()
+_active_user_data_dirs_lock = threading.Lock()
+_process_exit_cleanup_lock = threading.Lock()
+_process_exit_cleanup_registered = False
+_original_sigint_handler = None
+_original_sigterm_handler = None
+
+
+def _log_run_message(message: str) -> None:
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{now}] [SearchRunnerService] {message}"
+    print(line, flush=True)
+    try:
+        _get_run_logger().info(line)
+    except Exception:
+        pass
+
+
+def _register_user_data_dir(path: str) -> None:
+    with _active_user_data_dirs_lock:
+        _active_user_data_dirs.add(path)
+
+
+def _unregister_user_data_dir(path: str) -> None:
+    with _active_user_data_dirs_lock:
+        _active_user_data_dirs.discard(path)
+
+
+def _kill_processes_for_user_data_dir(user_data_dir: str) -> None:
+    if os.name == "nt":
+        escaped = user_data_dir.replace("'", "''")
+        script = (
+            "Get-CimInstance Win32_Process | "
+            f"Where-Object {{ $_.CommandLine -like '*{escaped}*' }} | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+        )
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                check=False,
+                timeout=15,
+                capture_output=True,
+            )
+        except Exception:
+            return
+        return
+
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", user_data_dir],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except Exception:
+        return
+    for pid_str in result.stdout.split():
+        if not pid_str.strip().isdigit():
+            continue
+        try:
+            os.kill(int(pid_str), signal.SIGKILL)
+        except ProcessLookupError:
+            continue
+        except Exception:
+            continue
+
+
+def _remove_user_data_dir_path(path: str, label: str, *, log: bool = True) -> None:
+    _unregister_user_data_dir(path)
+    _kill_processes_for_user_data_dir(path)
+    profile_path = Path(path)
+    try:
+        if profile_path.exists():
+            shutil.rmtree(profile_path)
+            if log:
+                _log_run_message(f"{label}: удалён временный профиль Chrome: {path}.")
+    except Exception as error:
+        if log:
+            _log_run_message(
+                f"{label}: не удалось удалить временный профиль Chrome "
+                f"({error}): {path}."
+            )
+
+
+def cleanup_registered_user_data_dirs(label: str = "emergency", *, log: bool = True) -> None:
+    """Удаляет все временные профили Chrome, ещё числящиеся активными."""
+    with _active_user_data_dirs_lock:
+        paths = list(_active_user_data_dirs)
+    for path in paths:
+        _remove_user_data_dir_path(path, label, log=log)
+
+
+def _atexit_cleanup() -> None:
+    cleanup_registered_user_data_dirs("atexit", log=False)
+
+
+def _process_exit_signal_handler(signum: int, _frame) -> None:
+    cleanup_registered_user_data_dirs("signal", log=False)
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt
+    raise SystemExit(128 + signum)
+
+
+def ensure_process_exit_cleanup() -> None:
+    """Регистрирует очистку профилей Chrome при Ctrl+C, SIGTERM и выходе процесса."""
+    global _process_exit_cleanup_registered, _original_sigint_handler, _original_sigterm_handler
+    with _process_exit_cleanup_lock:
+        if _process_exit_cleanup_registered:
+            return
+        _process_exit_cleanup_registered = True
+        atexit.register(_atexit_cleanup)
+        if threading.current_thread() is not threading.main_thread():
+            return
+        _original_sigint_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, _process_exit_signal_handler)
+        if hasattr(signal, "SIGTERM"):
+            _original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, _process_exit_signal_handler)
 
 
 class _ActionBudget:
@@ -2875,6 +2997,16 @@ class SearchRunnerService:
         except Exception:
             return True
 
+    def _cleanup_user_data_dir(self, browser, label: str) -> None:
+        """Удаляет временный профиль Chrome, созданный через ``mkdtemp``."""
+        if browser is None:
+            return
+        user_data_dir = getattr(browser, "_seo_soft_user_data_dir", None)
+        if not user_data_dir:
+            return
+        _remove_user_data_dir_path(str(user_data_dir), label)
+        browser._seo_soft_user_data_dir = None  # type: ignore[attr-defined]
+
     def _close_browser_session(
         self,
         context,
@@ -2892,25 +3024,28 @@ class SearchRunnerService:
         в пул. Поэтому всегда завершаем только через kill процесса.
         """
         del context  # контекст закрывается вместе с процессом браузера
-        if skip_kill:
-            self._log(f"{label}: браузер закрыт извне — принудительный kill пропущен.")
-            self._release_browser_pid(browser)
-            return
-        if force_fast:
-            self._log(f"{label}: закрываю браузер (быстрый режим после ошибки).")
-        else:
-            self._log(f"{label}: закрываю контекст и браузер.")
-        if self._kill_browser_subprocess(browser, label):
-            self._log(f"{label}: close-сессия завершена.")
-            return
-        if self._is_browser_disconnected(browser):
-            self._log(f"{label}: браузер уже отключён, close-сессия завершена.")
-            self._release_browser_pid(browser)
-            return
-        self._log(
-            f"{label}: pid браузера не найден — graceful close пропущен, "
-            "worker освобождён без ожидания Playwright."
-        )
+        try:
+            if skip_kill:
+                self._log(f"{label}: браузер закрыт извне — принудительный kill пропущен.")
+                self._release_browser_pid(browser)
+                return
+            if force_fast:
+                self._log(f"{label}: закрываю браузер (быстрый режим после ошибки).")
+            else:
+                self._log(f"{label}: закрываю контекст и браузер.")
+            if self._kill_browser_subprocess(browser, label):
+                self._log(f"{label}: close-сессия завершена.")
+                return
+            if self._is_browser_disconnected(browser):
+                self._log(f"{label}: браузер уже отключён, close-сессия завершена.")
+                self._release_browser_pid(browser)
+                return
+            self._log(
+                f"{label}: pid браузера не найден — graceful close пропущен, "
+                "worker освобождён без ожидания Playwright."
+            )
+        finally:
+            self._cleanup_user_data_dir(browser, label)
 
     @staticmethod
     def _browser_subprocess(browser):
@@ -3011,7 +3146,9 @@ class SearchRunnerService:
 
     def _launch_human_like_session(self, playwright):
         """Запускает изолированный Chrome/Chromium через persistent context."""
+        ensure_process_exit_cleanup()
         user_data_dir = tempfile.mkdtemp(prefix="shagteampro-chrome-")
+        _register_user_data_dir(user_data_dir)
         launch_kwargs = {
             "headless": False,
             "no_viewport": True,
