@@ -1007,7 +1007,7 @@ class SearchRunnerService:
 
             search_results_reached = True
             step_label = "открытие большой карты"
-            if not self._open_large_map(page):
+            if not self._open_large_map(page, search_query=query):
                 self._log(
                     f"{label}: на выдаче нет блока организаций/карты, "
                     "завершаю без поиска — слот пула освободится сразу."
@@ -1282,27 +1282,78 @@ class SearchRunnerService:
         except Exception:
             return 0
 
-    def _open_large_map(self, page) -> bool:
+    def _open_large_map(self, page, *, search_query: str = "") -> bool:
         """Открывает большую карту из поисковой выдачи Яндекса."""
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
         map_button_locator = page.locator(
             "a.OrgmnColumn-MapButton, button.MapLinks-GoToLink"
         ).first
-        try:
-            map_button_locator.wait_for(state="visible", timeout=_PLAYWRIGHT_ACTION_TIMEOUT_MS)
-        except PlaywrightTimeoutError:
+        large_map_locator = page.locator(
+            "ul.VerticalOrgsScroller-List, [class*='ModalWithMap']"
+        ).first
+
+        def _large_map_is_open() -> bool:
+            try:
+                return large_map_locator.is_visible()
+            except Exception:
+                return False
+
+        def _wait_and_click_map_button() -> bool:
+            try:
+                map_button_locator.wait_for(state="visible", timeout=_PLAYWRIGHT_ACTION_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                return False
+            page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
+            try:
+                map_button_locator.click(timeout=_PLAYWRIGHT_ACTION_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                self._log("simulate_search_action: не удалось нажать кнопку карты.")
+                return False
+            return True
+
+        if _large_map_is_open() or _wait_and_click_map_button():
+            return self._finalize_large_map_open(page)
+
+        fallback_url = self._build_yandex_companies_map_search_url(
+            page,
+            search_query=search_query,
+        )
+        if not fallback_url:
             self._log(
                 "simulate_search_action: на странице нет блока организаций/кнопки карты "
-                "(пустая выдача или другой формат SERP)."
+                "(пустая выдача или другой формат SERP), fallback URL собрать не удалось."
             )
             return False
-        page.wait_for_timeout(random.choice([1000, 1300, 1700, 2000]))
+
+        self._log(
+            "simulate_search_action: org-блок не найден, перехожу на выдачу companies/map "
+            f"(тот же URL, что у кнопки «На карте»): {fallback_url}"
+        )
         try:
-            map_button_locator.click(timeout=_PLAYWRIGHT_ACTION_TIMEOUT_MS)
-        except PlaywrightTimeoutError:
-            self._log("simulate_search_action: не удалось нажать кнопку карты.")
+            page.goto(fallback_url, wait_until="domcontentloaded")
+        except Exception as error:
+            self._log(f"simulate_search_action: не удалось открыть fallback companies/map: {error}")
             return False
+
+        page.wait_for_timeout(random.randint(2500, 4200))
+        self._handle_captcha_if_present(
+            page,
+            wait_ms=3000,
+            context="после перехода на companies/map",
+        )
+
+        if _large_map_is_open() or _wait_and_click_map_button():
+            return self._finalize_large_map_open(page)
+
+        self._log(
+            "simulate_search_action: на странице нет блока организаций/кнопки карты "
+            "(пустая выдача или другой формат SERP) даже после fallback companies/map."
+        )
+        return False
+
+    def _finalize_large_map_open(self, page) -> bool:
+        """Общие шаги после открытия большой карты (клик или fallback URL)."""
         self._log("simulate_search_action: открыта большая карта.")
         self._handle_captcha_if_present(page, wait_ms=3000, context="после открытия большой карты")
         page.wait_for_timeout(random.randint(2000, 3000))
@@ -3391,6 +3442,43 @@ class SearchRunnerService:
         except (TypeError, ValueError):
             return 0
         return max(0, converted)
+
+    @staticmethod
+    def _build_yandex_companies_map_search_url(
+        page,
+        *,
+        search_query: str = "",
+        default_lr: str = "35",
+    ) -> str | None:
+        """Собирает URL выдачи companies/map — тот же, что в href кнопки OrgmnColumn-MapButton."""
+        from urllib.parse import parse_qs, quote, urlencode, urlparse
+
+        text = search_query.strip()
+        lr = default_lr
+
+        if not text:
+            try:
+                parsed = urlparse(page.url)
+                params = parse_qs(parsed.query, keep_blank_values=False)
+                text = (params.get("text") or [""])[0].strip()
+                lr = (params.get("lr") or [default_lr])[0] or default_lr
+            except Exception:
+                return None
+
+        if not text:
+            return None
+
+        query = urlencode(
+            {
+                "lr": lr,
+                "text": text,
+                "serp-reload-from": "companies",
+                "intent": "map",
+                "noreask": "1",
+            },
+            quote_via=quote,
+        )
+        return f"https://ya.ru/search/?{query}"
 
     @staticmethod
     def _build_maps_url(card_payload: dict[str, object]) -> str:

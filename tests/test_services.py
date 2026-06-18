@@ -1194,6 +1194,109 @@ def test_dismiss_distribution_modal_on_map_skips_close_button_click() -> None:
     assert page.keyboard.pressed == []
 
 
+def test_build_yandex_companies_map_search_url_from_query() -> None:
+    url = SearchRunnerService._build_yandex_companies_map_search_url(
+        _DummyPageWithUrl("https://ya.ru/"),
+        search_query="Покушать Москва, просп. Маршала Жукова,",
+    )
+    assert url is not None
+    assert "intent=map" in url
+    assert "serp-reload-from=companies" in url
+    assert "noreask=1" in url
+    assert "lr=35" in url
+    assert "text=" in url
+
+
+def test_build_yandex_companies_map_search_url_from_page_url() -> None:
+    page_url = (
+        "https://ya.ru/search/?text=foo+bar&lr=35"
+        "&search_source=yaru_desktop_common&search_domain=yaru"
+    )
+    url = SearchRunnerService._build_yandex_companies_map_search_url(
+        _DummyPageWithUrl(page_url),
+    )
+    assert url is not None
+    assert "intent=map" in url
+    assert "text=foo" in url or "text=foo+bar" in url
+
+
+class _DummyPageWithUrl:
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+
+def test_open_large_map_uses_companies_map_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+    service = SearchRunnerService()
+    goto_calls: list[str] = []
+    finalized = {"count": 0}
+
+    class _MapButtonLocator:
+        def __init__(self) -> None:
+            self._visible = False
+
+        def wait_for(self, **_kwargs) -> None:
+            raise PlaywrightTimeoutError("missing")
+
+        def click(self, **_kwargs) -> None:
+            return
+
+        @property
+        def first(self) -> "_MapButtonLocator":
+            return self
+
+    class _LargeMapLocator:
+        def __init__(self) -> None:
+            self._visible_after_goto = False
+
+        def is_visible(self) -> bool:
+            return self._visible_after_goto
+
+        @property
+        def first(self) -> "_LargeMapLocator":
+            return self
+
+    class _FallbackPage:
+        url = (
+            "https://ya.ru/search/?text=test+query&lr=35"
+            "&search_source=yaru_desktop_common"
+        )
+
+        def __init__(self) -> None:
+            self.map_button = _MapButtonLocator()
+            self.large_map = _LargeMapLocator()
+
+        def locator(self, selector: str):
+            if selector.startswith("ul.VerticalOrgsScroller-List"):
+                return self.large_map
+            return self.map_button
+
+        def goto(self, url: str, **_kwargs) -> None:
+            goto_calls.append(url)
+            self.large_map._visible_after_goto = True
+
+        def wait_for_timeout(self, _ms: int) -> None:
+            return
+
+    page = _FallbackPage()
+    monkeypatch.setattr(service, "_handle_captcha_if_present", lambda *_args, **_kwargs: None)
+
+    def fake_finalize(_page) -> bool:
+        finalized["count"] += 1
+        return True
+
+    monkeypatch.setattr(service, "_finalize_large_map_open", fake_finalize)
+
+    assert service._open_large_map(page, search_query="test query") is True
+    assert len(goto_calls) == 1
+    assert "intent=map" in goto_calls[0]
+    assert "serp-reload-from=companies" in goto_calls[0]
+    assert finalized["count"] == 1
+
+
 def test_open_large_map_dismisses_distribution_modal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
