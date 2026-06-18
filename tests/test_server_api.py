@@ -13,12 +13,12 @@ from webapp.server import AppServices, build_services, create_app
 
 class StubSearchRunner:
     def __init__(self) -> None:
-        self.calls: list[tuple[list[str], str, str]] = []
+        self.calls: list[tuple[list[str], str, str, str]] = []
         self.optimization_calls: list[tuple[list[dict], int]] = []
 
-    def run_yandex_searches(self, phrases, city: str, street: str) -> int:
+    def run_yandex_searches(self, phrases, city: str, street: str, house: str = "") -> int:
         captured = list(phrases)
-        self.calls.append((captured, city, street))
+        self.calls.append((captured, city, street, house))
         return len(captured)
 
     def run_cards_optimization(self, cards: list[dict], threads: int, **kwargs) -> dict:
@@ -111,7 +111,7 @@ def test_api_health_and_cards_flow(tmp_path: Path) -> None:
 
         run_result = client.post(f"/api/cards/{card_id}/run-search").json()
         assert run_result == {"executed": 1}
-        assert stub_runner.calls[0] == (["query one"], "SPB", "Nevsky")
+        assert stub_runner.calls[0] == (["query one"], "SPB", "Nevsky", "")
 
         delete_card_result = client.delete(f"/api/cards/{card_id}")
         assert delete_card_result.status_code == 200
@@ -192,6 +192,9 @@ def test_api_optimization_run_uses_selected_cards_and_flags(tmp_path: Path) -> N
             json={
                 "search_transitions": 2,
                 "maps_transitions": 4,
+                "city": "Москва",
+                "street": "Ленинский проспект",
+                "house": "48 корп 1",
                 "coordinates": " 37.631182, 55.771363 ",
                 "competitor_open_chance_percent": 45,
                 "max_open_competitor_cards": 3,
@@ -238,6 +241,9 @@ def test_api_optimization_run_uses_selected_cards_and_flags(tmp_path: Path) -> N
         assert card_a_payload["maps_target"] == 1
         assert card_b_payload["search_target"] == 2
         assert card_b_payload["maps_target"] == 4
+        assert card_b_payload["city"] == "Москва"
+        assert card_b_payload["street"] == "Ленинский проспект"
+        assert card_b_payload["house"] == "48 корп 1"
         assert card_b_payload["coordinates"] == "37.631182, 55.771363"
         assert card_b_payload["competitor_open_chance_percent"] == 45
         assert card_b_payload["max_open_competitor_cards"] == 3

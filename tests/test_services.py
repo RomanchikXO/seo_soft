@@ -626,6 +626,12 @@ def test_notification_proxy_validation() -> None:
 def test_search_runner_build_query() -> None:
     assert SearchRunnerService._build_query("alpha", "Moscow", "Arbat") == "alpha Moscow Arbat"
     assert SearchRunnerService._build_query("alpha", "", "Arbat") == "alpha Arbat"
+    assert SearchRunnerService._build_query("alpha", "Moscow", "Arbat", "12") == "alpha Moscow Arbat 12"
+    assert SearchRunnerService._build_query("alpha", "Moscow", "Arbat", "") == "alpha Moscow Arbat"
+    assert (
+        SearchRunnerService._build_query("стоматология", "Москва", "Ленинский проспект", "48 корп 1")
+        == "стоматология Москва Ленинский проспект 48 корп 1"
+    )
 
 
 class _FakeLocator:

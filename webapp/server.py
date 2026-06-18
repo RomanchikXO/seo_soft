@@ -215,6 +215,7 @@ def _build_optimization_cards_payload(
                 "maps_target": card_settings.get("maps_transitions", 0),
                 "city": card_settings.get("city", ""),
                 "street": card_settings.get("street", ""),
+                "house": card_settings.get("house", ""),
                 "organization": card_settings.get("organization", ""),
                 "coordinates": card_settings.get("coordinates", ""),
                 "map_zoom_clicks": card_settings.get("map_zoom_clicks", 0),
@@ -433,10 +434,12 @@ def create_app(base_dir: Path | None = None, services: AppServices | None = None
         settings = resolved_services.settings_service.load_card_settings(card_id)
         city = settings.get("city", "")
         street = settings.get("street", "")
-        if not city and not street:
+        house = settings.get("house", "")
+        if not city and not street and not house:
             fallback_settings = resolved_services.settings_service.load_settings()
             city = fallback_settings.get("city", "")
             street = fallback_settings.get("street", "")
+            house = fallback_settings.get("house", "")
         keys = resolved_services.key_service.list_for_card(card_id)
         phrases = [item.phrase for item in keys if item.search_enabled]
         if not phrases:
@@ -445,6 +448,7 @@ def create_app(base_dir: Path | None = None, services: AppServices | None = None
             phrases=phrases,
             city=city,
             street=street,
+            house=house,
         )
         return {"executed": executed}
 

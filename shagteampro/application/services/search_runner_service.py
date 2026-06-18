@@ -169,10 +169,11 @@ class SearchRunnerService:
         phrases: Iterable[str],
         city: str,
         street: str,
+        house: str = "",
     ) -> int:
         """Выполняет простой пакетный поиск фраз в Яндексе."""
         self._update_captcha_service()
-        queries = [self._build_query(phrase, city, street) for phrase in phrases]
+        queries = [self._build_query(phrase, city, street, house) for phrase in phrases]
         queries = [query for query in queries if query]
         if not queries:
             self._log("Список поисковых запросов пуст, выполнение пропущено.")
@@ -799,6 +800,7 @@ class SearchRunnerService:
         phrase = str(key_payload.get("phrase", ""))
         city = str(card_payload.get("city", ""))
         street = str(card_payload.get("street", ""))
+        house = str(card_payload.get("house", ""))
         organization = str(card_payload.get("organization", ""))
         map_zoom_clicks = self._to_non_negative_int(card_payload.get("map_zoom_clicks", 0))
         min_sleep_overview = self._to_non_negative_int(card_payload.get("min_sleep_target_overview_sec", 0))
@@ -806,7 +808,7 @@ class SearchRunnerService:
         if max_sleep_overview < min_sleep_overview:
             max_sleep_overview = min_sleep_overview
         
-        query = self._build_query(phrase, city, street)
+        query = self._build_query(phrase, city, street, house)
         if not query:
             self._log("simulate_search_action: пустой запрос, пропуск.")
             return False
@@ -3240,9 +3242,9 @@ class SearchRunnerService:
         return "".join(str(value).split())
 
     @staticmethod
-    def _build_query(phrase: str, city: str, street: str) -> str:
-        """Собирает поисковый запрос из фразы, города и улицы."""
-        parts = [phrase.strip(), city.strip(), street.strip()]
+    def _build_query(phrase: str, city: str, street: str, house: str = "") -> str:
+        """Собирает поисковый запрос из фразы, города, улицы и номера дома."""
+        parts = [phrase.strip(), city.strip(), street.strip(), house.strip()]
         return " ".join(part for part in parts if part)
 
     @staticmethod
