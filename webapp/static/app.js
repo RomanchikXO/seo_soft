@@ -109,6 +109,8 @@ const state = {
   activeTab: "keys",
   optimizationThreads: 1,
   optimizationSelectedCardIds: new Set(),
+  cardDeleteMode: false,
+  cardDeleteSelectedIds: new Set(),
   scheduleMode: "auto",
   autoWeekdays: new Set(),
   tasks: [],
@@ -136,7 +138,9 @@ const ui = {
   initProgress: document.getElementById("initProgress"),
 
   cardsList: document.getElementById("cardsList"),
+  toggleDeleteModeBtn: document.getElementById("toggleDeleteModeBtn"),
   addCardBtn: document.getElementById("addCardBtn"),
+  deleteSelectedCardsBtn: document.getElementById("deleteSelectedCardsBtn"),
 
   workspaceEmpty: document.getElementById("workspaceEmpty"),
   workspaceContent: document.getElementById("workspaceContent"),
@@ -262,55 +266,81 @@ async function loadCards() {
   state.optimizationSelectedCardIds = new Set(
     [...state.optimizationSelectedCardIds].filter((cardId) => availableIds.has(cardId))
   );
+  state.cardDeleteSelectedIds = new Set(
+    [...state.cardDeleteSelectedIds].filter((cardId) => availableIds.has(cardId))
+  );
   renderCards();
   refreshOptimizationStatus();
+  refreshCardDeleteUi();
+}
+
+function createCardCheckbox(card, mode) {
+  const isDeleteMode = mode === "delete";
+  const selectedIds = isDeleteMode ? state.cardDeleteSelectedIds : state.optimizationSelectedCardIds;
+
+  const toggleLabel = document.createElement("label");
+  toggleLabel.className = isDeleteMode ? "card-opt-toggle card-delete-toggle" : "card-opt-toggle";
+  toggleLabel.title = isDeleteMode ? "Выбрать для удаления" : "Выбрать карточку для оптимизации";
+  toggleLabel.onclick = (event) => event.stopPropagation();
+
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.checked = selectedIds.has(card.id);
+  checkbox.setAttribute(
+    "aria-label",
+    isDeleteMode ? `Выбрать для удаления ${card.name}` : `Выбрать карточку ${card.name}`
+  );
+  checkbox.onclick = (event) => event.stopPropagation();
+  checkbox.onchange = (event) => {
+    event.stopPropagation();
+    if (checkbox.checked) {
+      selectedIds.add(card.id);
+    } else {
+      selectedIds.delete(card.id);
+    }
+    if (isDeleteMode) {
+      refreshCardDeleteUi();
+    } else {
+      refreshOptimizationStatus();
+    }
+  };
+
+  const checkboxView = document.createElement("span");
+  checkboxView.className = "card-opt-box";
+
+  toggleLabel.appendChild(checkbox);
+  toggleLabel.appendChild(checkboxView);
+  return toggleLabel;
 }
 
 function renderCards() {
   ui.cardsList.innerHTML = "";
+  const showCheckboxes = state.cardDeleteMode || state.activeTab === "optimization";
   for (const card of state.cards) {
-    const item = document.createElement(state.activeTab === "optimization" ? "div" : "button");
+    const item = document.createElement("div");
     item.className = `card-item ${state.selectedCardId === card.id ? "active" : ""}`;
-    if (state.activeTab === "optimization") {
-      const row = document.createElement("div");
-      row.className = "card-item-row";
 
-      const toggleLabel = document.createElement("label");
-      toggleLabel.className = "card-opt-toggle";
-      toggleLabel.title = "Выбрать карточку для оптимизации";
-      toggleLabel.onclick = (event) => event.stopPropagation();
+    const row = document.createElement("div");
+    row.className = "card-item-row";
 
-      const checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.checked = state.optimizationSelectedCardIds.has(card.id);
-      checkbox.setAttribute("aria-label", `Выбрать карточку ${card.name}`);
-      checkbox.onclick = (event) => event.stopPropagation();
-      checkbox.onchange = (event) => {
-        event.stopPropagation();
-        if (checkbox.checked) {
-          state.optimizationSelectedCardIds.add(card.id);
-        } else {
-          state.optimizationSelectedCardIds.delete(card.id);
-        }
-        refreshOptimizationStatus();
-      };
-
-      const checkboxView = document.createElement("span");
-      checkboxView.className = "card-opt-box";
-
-      const name = document.createElement("span");
-      name.className = "card-item-name";
-      name.textContent = card.name;
-
-      toggleLabel.appendChild(checkbox);
-      toggleLabel.appendChild(checkboxView);
-      row.appendChild(toggleLabel);
-      row.appendChild(name);
-      item.appendChild(row);
-    } else {
-      item.textContent = card.name;
+    const checkboxSlot = document.createElement("div");
+    checkboxSlot.className = "card-item-checkbox-slot";
+    if (showCheckboxes) {
+      const checkboxMode = state.cardDeleteMode ? "delete" : "optimization";
+      checkboxSlot.appendChild(createCardCheckbox(card, checkboxMode));
     }
-    item.onclick = () => selectCard(card.id, card.name);
+    row.appendChild(checkboxSlot);
+
+    const name = document.createElement("span");
+    name.className = "card-item-name";
+    name.textContent = card.name;
+    row.appendChild(name);
+
+    item.appendChild(row);
+
+    if (!state.cardDeleteMode) {
+      item.onclick = () => selectCard(card.id, card.name);
+    }
     ui.cardsList.appendChild(item);
   }
 }
@@ -600,7 +630,10 @@ function switchTab(tab) {
 }
 
 function refreshOptimizationStatus() {
-  ui.optimizationSelectAllBtn.classList.toggle("hidden", state.activeTab !== "optimization");
+  ui.optimizationSelectAllBtn.classList.toggle(
+    "hidden",
+    state.activeTab !== "optimization" || state.cardDeleteMode
+  );
 
   const allSelected =
     state.cards.length > 0 && state.cards.every((card) => state.optimizationSelectedCardIds.has(card.id));
@@ -613,6 +646,50 @@ function refreshOptimizationStatus() {
   }
   const selectedCount = state.optimizationSelectedCardIds.size;
   ui.optimizationStatus.textContent = `Выбрано карточек: ${selectedCount}. Потоки: ${state.optimizationThreads}.`;
+}
+
+function refreshCardDeleteUi() {
+  ui.toggleDeleteModeBtn.classList.toggle("active", state.cardDeleteMode);
+  ui.deleteSelectedCardsBtn.classList.toggle("hidden", !state.cardDeleteMode);
+  ui.deleteSelectedCardsBtn.disabled = state.cardDeleteSelectedIds.size === 0;
+  ui.addCardBtn.disabled = state.cardDeleteMode;
+  document.body.classList.toggle("card-delete-mode", state.cardDeleteMode);
+}
+
+function toggleCardDeleteMode() {
+  state.cardDeleteMode = !state.cardDeleteMode;
+  if (!state.cardDeleteMode) {
+    state.cardDeleteSelectedIds.clear();
+  }
+  renderCards();
+  refreshCardDeleteUi();
+  refreshOptimizationStatus();
+}
+
+async function deleteSelectedCards() {
+  const cardIds = [...state.cardDeleteSelectedIds];
+  if (cardIds.length === 0) {
+    alert("Выберите карточки для удаления.");
+    return;
+  }
+  const confirmed = confirm(
+    `Удалить ${cardIds.length} карточек?\nЭто удалит ключевые фразы и всю статистику без возможности восстановления.`
+  );
+  if (!confirmed) return;
+
+  try {
+    for (const cardId of cardIds) {
+      await api(`/api/cards/${cardId}`, { method: "DELETE" });
+      state.optimizationSelectedCardIds.delete(cardId);
+      if (state.selectedCardId === cardId) {
+        clearSelectedCardView();
+      }
+    }
+    state.cardDeleteSelectedIds.clear();
+    await loadCards();
+  } catch (error) {
+    alert(`Не удалось удалить карточки: ${error.message}`);
+  }
 }
 
 function syncOptimizationThreadsUi() {
@@ -634,6 +711,7 @@ function clearSelectedCardView() {
 }
 
 function openCreateCardModal() {
+  if (state.cardDeleteMode) return;
   state.settingsMode = "create";
   ui.settingsModalTitle.textContent = "Добавить карточку";
   ui.saveSettingsBtn.textContent = "Создать карточку";
@@ -820,6 +898,8 @@ function requestShutdownOnClose() {
   }
 }
 
+ui.toggleDeleteModeBtn.onclick = toggleCardDeleteMode;
+ui.deleteSelectedCardsBtn.onclick = deleteSelectedCards;
 ui.addCardBtn.onclick = openCreateCardModal;
 ui.addKeyBtn.onclick = addKey;
 ui.deleteKeyBtn.onclick = deleteKey;

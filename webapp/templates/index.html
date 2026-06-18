@@ -30,7 +30,11 @@
       <div class="panel-title">Карточки</div>
       <button id="optimizationSelectAllBtn" class="btn hidden">Выбрать все</button>
       <div id="cardsList" class="cards-list"></div>
-      <button id="addCardBtn" class="btn primary">+ Добавить карточку</button>
+      <button id="deleteSelectedCardsBtn" class="btn danger hidden">Удалить выбранные</button>
+      <div id="cardActionsBar" class="card-actions-bar">
+        <button id="toggleDeleteModeBtn" class="card-action-btn card-action-delete" type="button">Режим удаления</button>
+        <button id="addCardBtn" class="card-action-btn card-action-add" type="button">+ Добавить карточку</button>
+      </div>
     </aside>
 
     <aside class="schedule-panel">

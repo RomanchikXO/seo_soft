@@ -44,8 +44,88 @@ body {
   overflow: hidden;
 }
 .panel-title { color: #a3a3a3; font-size: 13px; text-transform: uppercase; }
-#optimizationSelectAllBtn {
+#optimizationSelectAllBtn,
+#deleteSelectedCardsBtn {
   width: 100%;
+}
+.card-actions-bar {
+  display: flex;
+  gap: 6px;
+  width: 100%;
+}
+.card-action-btn {
+  border-radius: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font: inherit;
+  transition: transform 160ms ease, box-shadow 160ms ease, filter 160ms ease, border-color 160ms ease;
+  transform-origin: center;
+}
+.card-action-delete {
+  flex: 1;
+  border: 1px solid #8c2a2a;
+  background: #4f1515;
+  color: #ffeaea;
+  font-size: 12px;
+  line-height: 1.25;
+  text-align: center;
+}
+.card-action-add {
+  flex: 2;
+  border: 1px solid #fff;
+  background: #f2f2f2;
+  color: #090909;
+}
+.card-action-btn:hover,
+.card-action-delete.active {
+  transform: scale(1.04);
+  filter: brightness(1.12);
+}
+.card-action-delete:hover,
+.card-action-delete.active {
+  box-shadow:
+    0 0 8px rgba(255, 80, 80, 0.55),
+    0 0 22px rgba(220, 50, 50, 0.65),
+    0 0 40px rgba(180, 30, 30, 0.45);
+  border-color: #e85555;
+}
+.card-action-add:hover {
+  box-shadow:
+    0 0 8px rgba(255, 255, 255, 0.75),
+    0 0 22px rgba(255, 255, 255, 0.45),
+    0 0 40px rgba(255, 255, 255, 0.25);
+}
+.card-action-add:disabled,
+.card-action-add:disabled:hover {
+  opacity: 0.42;
+  cursor: not-allowed;
+  filter: grayscale(0.3);
+  transform: none !important;
+  box-shadow: none !important;
+}
+body.card-delete-mode .topbar,
+body.card-delete-mode .schedule-panel,
+body.card-delete-mode .workspace {
+  pointer-events: none;
+  opacity: 0.42;
+  filter: grayscale(0.12);
+}
+body.card-delete-mode #optimizationSelectAllBtn {
+  pointer-events: none;
+  opacity: 0.42;
+}
+body.card-delete-mode .card-item {
+  pointer-events: none;
+  cursor: default;
+}
+body.card-delete-mode .card-delete-toggle {
+  pointer-events: auto;
+  cursor: pointer;
+}
+.card-delete-toggle input:checked + .card-opt-box {
+  border-color: #e05555;
+  background: linear-gradient(180deg, #e05555, #a82828);
+  box-shadow: 0 0 0 2px rgba(224, 85, 85, 0.22), inset 0 1px 1px rgba(255, 255, 255, 0.2);
 }
 .cards-list {
   flex: 1;
@@ -67,18 +147,34 @@ body {
   cursor: pointer;
   color: #ffffff;
   width: 100%;
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+  font: inherit;
+  line-height: 1.25;
   text-align: left;
-}
-.card-item.active {
-  background: #2a2a2a;
-  color: #ffffff;
-  border-color: #7a7a7a;
 }
 .card-item-row {
   width: 100%;
   display: flex;
   align-items: center;
   gap: 10px;
+  min-height: 18px;
+}
+.card-item-checkbox-slot {
+  width: 18px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.card-item-checkbox-slot:empty {
+  display: none;
+}
+.card-item.active {
+  background: #2a2a2a;
+  color: #ffffff;
+  border-color: #7a7a7a;
 }
 .card-item-name {
   flex: 1;
