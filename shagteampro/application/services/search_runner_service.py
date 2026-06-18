@@ -1286,7 +1286,9 @@ class SearchRunnerService:
         """Открывает большую карту из поисковой выдачи Яндекса."""
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
-        map_button_locator = page.locator("a.OrgmnColumn-MapButton").first
+        map_button_locator = page.locator(
+            "a.OrgmnColumn-MapButton, button.MapLinks-GoToLink"
+        ).first
         try:
             map_button_locator.wait_for(state="visible", timeout=_PLAYWRIGHT_ACTION_TIMEOUT_MS)
         except PlaywrightTimeoutError:

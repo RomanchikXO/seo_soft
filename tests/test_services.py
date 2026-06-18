@@ -1213,7 +1213,7 @@ def test_open_large_map_dismisses_distribution_modal(
 
     class _DummyPage:
         def locator(self, selector: str) -> _MapButtonLocator:
-            assert selector == "a.OrgmnColumn-MapButton"
+            assert selector == "a.OrgmnColumn-MapButton, button.MapLinks-GoToLink"
             return _MapButtonLocator()
 
         def wait_for_timeout(self, _ms: int) -> None:
