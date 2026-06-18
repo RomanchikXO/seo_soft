@@ -40,6 +40,8 @@ body {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  min-height: 0;
+  overflow: hidden;
 }
 .panel-title { color: #a3a3a3; font-size: 13px; text-transform: uppercase; }
 #optimizationSelectAllBtn {
@@ -47,7 +49,8 @@ body {
 }
 .cards-list {
   flex: 1;
-  overflow: auto;
+  min-height: 0;
+  overflow-y: auto;
   border: 1px solid #303030;
   border-radius: 10px;
   background: #101010;
