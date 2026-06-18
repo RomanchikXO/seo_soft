@@ -427,16 +427,16 @@ class SearchRunnerService:
             )
 
         def has_pending_work() -> bool:
-            return self._pick_dispatchable_target(targets) is not None
+            return self._has_dispatchable_work(targets)
 
         def fill(executor: concurrent.futures.Executor) -> None:
             if not is_dispatch_allowed(progress_run_id):
                 return
             while len(future_meta) < max_workers:
-                state = self._pick_dispatchable_target(targets)
-                if state is None:
+                picked = self._pick_dispatchable_action(targets)
+                if picked is None:
                     break
-                key_payload = random.choice(state["active_keys"])
+                state, key_payload = picked
                 state["in_flight"] += 1
                 worker_id = uuid.uuid4().hex
                 future = executor.submit(self._execute_single_action, state, key_payload, worker_id)
@@ -499,15 +499,40 @@ class SearchRunnerService:
         return int(state.get("performed", 0) or 0) + int(state.get("in_flight", 0) or 0)
 
     @staticmethod
-    def _pick_dispatchable_target(targets: list[dict[str, object]]) -> dict[str, object] | None:
-        """Выбирает цель, которой ещё нужны успешные переходы и есть активные ключи."""
+    def _has_dispatchable_work(targets: list[dict[str, object]]) -> bool:
+        """Проверяет, остались ли цели с активными ключами и не набранным лимитом успехов."""
         for state in targets:
             if not state["active_keys"]:
                 continue
             if SearchRunnerService._scheduled_successes(state) >= int(state["target"]):
                 continue
-            return state
-        return None
+            return True
+        return False
+
+    @staticmethod
+    def _iter_dispatchable_actions(
+        targets: list[dict[str, object]],
+    ) -> list[tuple[dict[str, object], dict[str, object]]]:
+        """Собирает все пары (цель, ключ), доступные для запуска в общем пуле задачи."""
+        candidates: list[tuple[dict[str, object], dict[str, object]]] = []
+        for state in targets:
+            if not state["active_keys"]:
+                continue
+            if SearchRunnerService._scheduled_successes(state) >= int(state["target"]):
+                continue
+            for key_payload in state["active_keys"]:
+                candidates.append((state, key_payload))
+        return candidates
+
+    @staticmethod
+    def _pick_dispatchable_action(
+        targets: list[dict[str, object]],
+    ) -> tuple[dict[str, object], dict[str, object]] | None:
+        """Случайно выбирает пару (цель, ключ) из общего пула всех карточек задачи."""
+        candidates = SearchRunnerService._iter_dispatchable_actions(targets)
+        if not candidates:
+            return None
+        return random.choice(candidates)
 
     def _consume_action_result(
         self,

@@ -449,17 +449,128 @@ def test_merge_key_failure_reports_keeps_search_and_maps_separately() -> None:
     ]
 
 
-def test_pick_dispatchable_target_stops_at_success_target_not_on_failures() -> None:
+def test_has_dispatchable_work_stops_at_success_target_not_on_failures() -> None:
     state = {"performed": 2, "failures": 3, "in_flight": 1, "target": 10, "active_keys": [{}]}
     assert SearchRunnerService._scheduled_successes(state) == 3
-    assert SearchRunnerService._pick_dispatchable_target([state]) is state
+    assert SearchRunnerService._has_dispatchable_work([state]) is True
     state["failures"] = 99
-    assert SearchRunnerService._pick_dispatchable_target([state]) is state
+    assert SearchRunnerService._has_dispatchable_work([state]) is True
     state["performed"] = 10
     state["in_flight"] = 0
-    assert SearchRunnerService._pick_dispatchable_target([state]) is None
+    assert SearchRunnerService._has_dispatchable_work([state]) is False
     state = {"performed": 9, "failures": 0, "in_flight": 1, "target": 10, "active_keys": [{}]}
-    assert SearchRunnerService._pick_dispatchable_target([state]) is None
+    assert SearchRunnerService._has_dispatchable_work([state]) is False
+
+
+def test_pick_dispatchable_action_rotates_across_cards_in_one_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SearchRunnerService()
+    monkeypatch.setattr(service, "ensure_chromium_installed", lambda: False)
+    calls: list[tuple[int, int]] = []
+    pick_order = iter([1, 2, 1, 2, 1, 2])
+
+    def fake_choice(candidates: list[tuple[dict[str, object], dict[str, object]]]):
+        index = (next(pick_order, 1) - 1) % len(candidates)
+        return candidates[index]
+
+    def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]) -> bool:
+        calls.append((int(card_payload["card_id"]), int(key_payload["id"])))
+        return True
+
+    monkeypatch.setattr(
+        "shagteampro.application.services.search_runner_service.random.choice",
+        fake_choice,
+    )
+    monkeypatch.setattr(service, "_simulate_search_action", fake_search)
+
+    result = service.run_cards_optimization(
+        cards=[
+            {
+                "card_id": 1,
+                "card_name": "Card A",
+                "search_target": 3,
+                "maps_target": 0,
+                "keys": [{"id": 10, "search_enabled": True, "maps_enabled": False}],
+            },
+            {
+                "card_id": 2,
+                "card_name": "Card B",
+                "search_target": 3,
+                "maps_target": 0,
+                "keys": [{"id": 20, "search_enabled": True, "maps_enabled": False}],
+            },
+        ],
+        threads=1,
+    )
+
+    assert result["total_search_performed"] == 6
+    assert {card_id for card_id, _ in calls} == {1, 2}
+    assert calls.count((1, 10)) == 3
+    assert calls.count((2, 20)) == 3
+
+
+def test_pick_dispatchable_action_keeps_per_key_failure_counts_across_cards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = SearchRunnerService()
+    monkeypatch.setattr(service, "ensure_chromium_installed", lambda: False)
+    pick_order = iter([1, 2, 1, 2, 1, 2, 1, 2])
+
+    def fake_choice(candidates: list[tuple[dict[str, object], dict[str, object]]]):
+        index = next(pick_order, 0) - 1
+        return candidates[index % len(candidates)]
+
+    def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]):
+        card_id = int(card_payload["card_id"])
+        if card_id == 1:
+            return {"effect": False, "actions": {}, "count_failure": True}
+        return True
+
+    monkeypatch.setattr(
+        "shagteampro.application.services.search_runner_service.random.choice",
+        fake_choice,
+    )
+    monkeypatch.setattr(service, "_simulate_search_action", fake_search)
+
+    result = service.run_cards_optimization(
+        cards=[
+            {
+                "card_id": 1,
+                "card_name": "Card A",
+                "organization": "Org A",
+                "search_target": 2,
+                "maps_target": 0,
+                "keys": [{"id": 10, "phrase": "a", "search_enabled": True, "maps_enabled": False}],
+            },
+            {
+                "card_id": 2,
+                "card_name": "Card B",
+                "organization": "Org B",
+                "search_target": 2,
+                "maps_target": 0,
+                "keys": [{"id": 20, "phrase": "b", "search_enabled": True, "maps_enabled": False}],
+            },
+        ],
+        threads=1,
+    )
+
+    card_a = next(item for item in result["cards"] if item["card_id"] == 1)
+    card_b = next(item for item in result["cards"] if item["card_id"] == 2)
+    assert card_a["search_performed"] == 0
+    assert card_b["search_performed"] == 2
+    assert card_a["search_failures"] == SearchRunnerService.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY
+    assert card_b["search_failures"] == 0
+    assert card_a["key_failure_reports"] == [
+        {
+            "key_id": 10,
+            "phrase": "a",
+            "mode": "search",
+            "failures": SearchRunnerService.DEFAULT_MAX_FAILED_ATTEMPTS_PER_KEY,
+            "card_name": "Org A",
+        }
+    ]
+    assert card_b["key_failure_reports"] == []
 
 
 def test_increment_key_failure_removes_key_at_limit() -> None:
@@ -1404,8 +1515,10 @@ def test_search_runner_keeps_random_rotation_with_multiple_keys(
     calls: list[int] = []
     round_robin = {"step": 0}
 
-    def fake_choice(keys: list[dict[str, object]]) -> dict[str, object]:
-        picked = keys[round_robin["step"] % len(keys)]
+    def fake_choice(
+        candidates: list[tuple[dict[str, object], dict[str, object]]],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        picked = candidates[round_robin["step"] % len(candidates)]
         round_robin["step"] += 1
         return picked
 
@@ -1453,9 +1566,13 @@ def test_search_runner_keeps_going_until_success_target_with_multiple_keys(
     attempts: dict[int, int] = {11: 0, 12: 0, 13: 0}
     key_order = iter([12, 12, 13, 11, 12, 12, 13])
 
-    def fake_choice(keys: list[dict[str, object]]) -> dict[str, object]:
+    def fake_choice(
+        candidates: list[tuple[dict[str, object], dict[str, object]]],
+    ) -> tuple[dict[str, object], dict[str, object]]:
         next_id = next(key_order)
-        return next(key for key in keys if int(key["id"]) == next_id)
+        return next(
+            (state, key) for state, key in candidates if int(key["id"]) == next_id
+        )
 
     def fake_search(key_payload: dict[str, object], card_payload: dict[str, object]):
         key_id = int(key_payload["id"])
