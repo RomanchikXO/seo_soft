@@ -1000,6 +1000,7 @@ def test_close_browser_session_skips_graceful_close_and_kills_process(tmp_path: 
 
     browser = _Browser()
     service._close_browser_session(None, browser, "test")
+    service._cleanup_user_data_dir(browser, "test")
     assert closed_calls == []
     assert killed == [5151]
     assert not profile_dir.exists()
@@ -1037,6 +1038,7 @@ def test_close_browser_session_removes_user_data_dir_on_skip_kill(tmp_path: Path
 
     browser = _Browser()
     service._close_browser_session(None, browser, "test", skip_kill=True)
+    service._cleanup_user_data_dir(browser, "test")
     assert not profile_dir.exists()
     assert browser._seo_soft_user_data_dir is None
 

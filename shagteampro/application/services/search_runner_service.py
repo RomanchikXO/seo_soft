@@ -9,6 +9,7 @@ import os
 import random
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -54,6 +55,8 @@ def _get_run_logger() -> logging.Logger:
 
 _active_user_data_dirs: set[str] = set()
 _active_user_data_dirs_lock = threading.Lock()
+_WINDOWS_PROFILE_DELETE_ATTEMPTS = 5
+_PROFILE_DELETE_RETRY_DELAY_SEC = 0.25
 _process_exit_cleanup_lock = threading.Lock()
 _process_exit_cleanup_registered = False
 _original_sigint_handler = None
@@ -80,12 +83,31 @@ def _unregister_user_data_dir(path: str) -> None:
         _active_user_data_dirs.discard(path)
 
 
+def _user_data_dir_match_variants(user_data_dir: str) -> tuple[str, ...]:
+    normalized = os.path.normpath(user_data_dir)
+    variants = {normalized}
+    if os.name == "nt":
+        variants.add(normalized.replace("\\", "/"))
+        try:
+            variants.add(os.path.normcase(normalized))
+        except Exception:
+            pass
+    return tuple(variants)
+
+
+def _powershell_like_pattern(value: str) -> str:
+    return value.replace("'", "''")
+
+
 def _kill_processes_for_user_data_dir(user_data_dir: str) -> None:
     if os.name == "nt":
-        escaped = user_data_dir.replace("'", "''")
+        conditions = " -or ".join(
+            f"$_.CommandLine -like '*{_powershell_like_pattern(variant)}*'"
+            for variant in _user_data_dir_match_variants(user_data_dir)
+        )
         script = (
             "Get-CimInstance Win32_Process | "
-            f"Where-Object {{ $_.CommandLine -like '*{escaped}*' }} | "
+            f"Where-Object {{ $_.CommandLine -and ({conditions}) }} | "
             "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
         )
         try:
@@ -120,21 +142,44 @@ def _kill_processes_for_user_data_dir(user_data_dir: str) -> None:
             continue
 
 
-def _remove_user_data_dir_path(path: str, label: str, *, log: bool = True) -> None:
-    _unregister_user_data_dir(path)
-    _kill_processes_for_user_data_dir(path)
-    profile_path = Path(path)
+def _chmod_and_retry_rmtree(func, path_str: str, _exc_info) -> None:
     try:
-        if profile_path.exists():
-            shutil.rmtree(profile_path)
+        os.chmod(path_str, stat.S_IWRITE)
+        func(path_str)
+    except Exception:
+        raise
+
+
+def _remove_user_data_dir_path(path: str, label: str, *, log: bool = True) -> bool:
+    _unregister_user_data_dir(path)
+    profile_path = Path(path)
+    if not profile_path.exists():
+        return True
+
+    attempts = _WINDOWS_PROFILE_DELETE_ATTEMPTS if os.name == "nt" else 3
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            if os.name == "nt":
+                shutil.rmtree(profile_path, onerror=_chmod_and_retry_rmtree)
+            else:
+                shutil.rmtree(profile_path)
             if log:
                 _log_run_message(f"{label}: удалён временный профиль Chrome: {path}.")
-    except Exception as error:
-        if log:
-            _log_run_message(
-                f"{label}: не удалось удалить временный профиль Chrome "
-                f"({error}): {path}."
-            )
+            return True
+        except Exception as error:
+            last_error = error
+            if attempt + 1 >= attempts:
+                break
+            _kill_processes_for_user_data_dir(path)
+            time.sleep(_PROFILE_DELETE_RETRY_DELAY_SEC * (attempt + 1))
+
+    if log and last_error is not None:
+        _log_run_message(
+            f"{label}: не удалось удалить временный профиль Chrome "
+            f"({last_error}): {path}."
+        )
+    return False
 
 
 def cleanup_registered_user_data_dirs(label: str = "emergency", *, log: bool = True) -> None:
@@ -362,6 +407,7 @@ class SearchRunnerService:
     def _recreate_session(self, playwright, browsers_path: Path, old_context, old_browser):
         """Закрывает мёртвую сессию и поднимает новую (браузер/контекст/страница)."""
         self._close_browser_session(old_context, old_browser, "run_yandex_searches:recreate")
+        self._cleanup_user_data_dir(old_browser, "run_yandex_searches:recreate")
         browser, context = self._launch_chromium_with_recovery(playwright, browsers_path)
         page = self._open_browser_page(context)
         return context, browser, page
@@ -3057,8 +3103,8 @@ class SearchRunnerService:
         user_data_dir = getattr(browser, "_seo_soft_user_data_dir", None)
         if not user_data_dir:
             return
-        _remove_user_data_dir_path(str(user_data_dir), label)
-        browser._seo_soft_user_data_dir = None  # type: ignore[attr-defined]
+        if _remove_user_data_dir_path(str(user_data_dir), label):
+            browser._seo_soft_user_data_dir = None  # type: ignore[attr-defined]
 
     def _close_browser_session(
         self,
@@ -3077,28 +3123,25 @@ class SearchRunnerService:
         в пул. Поэтому всегда завершаем только через kill процесса.
         """
         del context  # контекст закрывается вместе с процессом браузера
-        try:
-            if skip_kill:
-                self._log(f"{label}: браузер закрыт извне — принудительный kill пропущен.")
-                self._release_browser_pid(browser)
-                return
-            if force_fast:
-                self._log(f"{label}: закрываю браузер (быстрый режим после ошибки).")
-            else:
-                self._log(f"{label}: закрываю контекст и браузер.")
-            if self._kill_browser_subprocess(browser, label):
-                self._log(f"{label}: close-сессия завершена.")
-                return
-            if self._is_browser_disconnected(browser):
-                self._log(f"{label}: браузер уже отключён, close-сессия завершена.")
-                self._release_browser_pid(browser)
-                return
-            self._log(
-                f"{label}: pid браузера не найден — graceful close пропущен, "
-                "worker освобождён без ожидания Playwright."
-            )
-        finally:
-            self._cleanup_user_data_dir(browser, label)
+        if skip_kill:
+            self._log(f"{label}: браузер закрыт извне — принудительный kill пропущен.")
+            self._release_browser_pid(browser)
+            return
+        if force_fast:
+            self._log(f"{label}: закрываю браузер (быстрый режим после ошибки).")
+        else:
+            self._log(f"{label}: закрываю контекст и браузер.")
+        if self._kill_browser_subprocess(browser, label):
+            self._log(f"{label}: close-сессия завершена.")
+            return
+        if self._is_browser_disconnected(browser):
+            self._log(f"{label}: браузер уже отключён, close-сессия завершена.")
+            self._release_browser_pid(browser)
+            return
+        self._log(
+            f"{label}: pid браузера не найден — graceful close пропущен, "
+            "worker освобождён без ожидания Playwright."
+        )
 
     @staticmethod
     def _browser_subprocess(browser):
@@ -3150,6 +3193,19 @@ class SearchRunnerService:
 
         killed_any = False
         for pid in reversed(pids):
+            if os.name == "nt":
+                try:
+                    result = subprocess.run(
+                        ["taskkill", "/F", "/T", "/PID", str(pid)],
+                        check=False,
+                        timeout=10,
+                        capture_output=True,
+                    )
+                    if result.returncode in (0, 128):
+                        killed_any = True
+                        continue
+                except Exception as error:
+                    self._log(f"{label}: taskkill({pid}) — {error}")
             try:
                 os.kill(pid, signal.SIGKILL)
                 killed_any = True
@@ -3157,6 +3213,7 @@ class SearchRunnerService:
                 continue
             except Exception as error:
                 self._log(f"{label}: os.kill({pid}) — {error}")
+
         self._release_browser_pid(browser)
         if killed_any:
             browser._seo_soft_killed = True  # type: ignore[attr-defined]
@@ -3196,6 +3253,8 @@ class SearchRunnerService:
             elapsed = time.monotonic() - started
             if elapsed >= 0.3:
                 self._log(f"{label}: playwright.stop() занял {elapsed:.1f} с.")
+
+        self._cleanup_user_data_dir(browser, label)
 
     def _launch_human_like_session(self, playwright):
         """Запускает изолированный Chrome/Chromium через persistent context."""
