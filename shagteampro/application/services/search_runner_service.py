@@ -7,6 +7,7 @@ import datetime
 import logging
 import os
 import random
+import re
 import shutil
 import signal
 import stat
@@ -59,7 +60,7 @@ _pending_delete_user_data_dirs: set[str] = set()
 _active_user_data_dirs_lock = threading.Lock()
 _WINDOWS_PROFILE_DELETE_ATTEMPTS = 8
 _PROFILE_DELETE_RETRY_DELAY_SEC = 0.25
-_ORPHAN_PROFILE_MIN_AGE_SEC = 90.0
+_ORPHAN_PROFILE_MIN_AGE_SEC = 60.0
 _process_exit_cleanup_lock = threading.Lock()
 _process_exit_cleanup_registered = False
 _original_sigint_handler = None
@@ -268,6 +269,62 @@ def sweep_orphan_chrome_profiles(label: str = "sweep", *, log: bool = False) -> 
     return removed
 
 
+_PLAYWRIGHT_BROWSER_DIR_RE = re.compile(r"^(?P<name>.+)-(?P<revision>\d+)$")
+
+
+def cleanup_stale_playwright_browsers(
+    browsers_path: Path, label: str = "browsers", *, log: bool = False
+) -> int:
+    """Удаляет устаревшие версии браузеров Playwright, оставляя самую свежую.
+
+    Каталог Playwright складывает версии браузеров в подкаталоги вида
+    ``chromium-1208`` / ``ffmpeg-1011``. При каждом обновлении ревизии старые
+    каталоги не удаляются и копятся, занимая сотни мегабайт. Здесь для каждого
+    семейства (``chromium``, ``chromium_headless_shell``, ``ffmpeg`` и т.п.)
+    оставляем только каталог с максимальной ревизией — именно его использует
+    Playwright, — а более старые удаляем.
+    """
+    try:
+        entries = [entry for entry in browsers_path.iterdir() if entry.is_dir()]
+    except Exception:
+        return 0
+
+    latest_revision: dict[str, int] = {}
+    parsed_entries: list[tuple[Path, str, int]] = []
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        match = _PLAYWRIGHT_BROWSER_DIR_RE.match(entry.name)
+        if match is None:
+            continue
+        name = match.group("name")
+        revision = int(match.group("revision"))
+        parsed_entries.append((entry, name, revision))
+        if revision > latest_revision.get(name, -1):
+            latest_revision[name] = revision
+
+    removed = 0
+    for entry, name, revision in parsed_entries:
+        if revision >= latest_revision.get(name, revision):
+            continue
+        try:
+            shutil.rmtree(entry, onerror=_chmod_and_retry_rmtree)
+        except Exception as error:
+            if log:
+                _log_run_message(
+                    f"{label}: не удалось удалить устаревшую версию браузера "
+                    f"{entry.name} ({error})."
+                )
+            continue
+        removed += 1
+        if log:
+            _log_run_message(f"{label}: удалена устаревшая версия браузера {entry.name}.")
+
+    if removed and log:
+        _log_run_message(f"{label}: удалено устаревших версий браузеров Playwright: {removed}.")
+    return removed
+
+
 def _atexit_cleanup() -> None:
     cleanup_registered_user_data_dirs("atexit", log=False)
 
@@ -405,12 +462,25 @@ class SearchRunnerService:
         executable_path = self._chromium_executable_path()
         if executable_path is not None and executable_path.exists():
             self._log(f"Chromium уже установлен: {executable_path}")
+            self._cleanup_stale_browsers(browsers_path)
             return False
 
         self._log("Chromium не найден, запускаю установку.")
         self._install_chromium(browsers_path)
         self._log("Установка Chromium завершена.")
+        self._cleanup_stale_browsers(browsers_path)
         return True
+
+    def _cleanup_stale_browsers(self, browsers_path: Path) -> None:
+        """Безопасно чистит устаревшие версии браузеров Playwright и осиротевшие профили."""
+        try:
+            cleanup_stale_playwright_browsers(browsers_path, "ensure-chromium", log=True)
+        except Exception as error:
+            self._log(f"Очистка устаревших версий браузеров пропущена: {error}")
+        try:
+            sweep_orphan_chrome_profiles("ensure-chromium", log=True)
+        except Exception as error:
+            self._log(f"Очистка осиротевших профилей Chrome пропущена: {error}")
 
     def run_yandex_searches(
         self,

@@ -13,6 +13,7 @@ from shagteampro.application.services.search_runner_service import (
     SearchRunnerService,
     _register_user_data_dir,
     cleanup_registered_user_data_dirs,
+    cleanup_stale_playwright_browsers,
     retry_pending_profile_deletes,
     sweep_orphan_chrome_profiles,
 )
@@ -1084,6 +1085,40 @@ def test_sweep_orphan_chrome_profiles_removes_stale_temp_dirs(
     assert not orphan.exists()
     assert fresh.exists()
     assert unrelated.exists()
+
+
+def test_cleanup_stale_playwright_browsers_keeps_latest_revision(tmp_path: Path) -> None:
+    browsers = tmp_path / "playwright-browsers"
+    browsers.mkdir()
+    for name in (
+        "chromium-1200",
+        "chromium-1208",
+        "chromium_headless_shell-1200",
+        "chromium_headless_shell-1208",
+        "ffmpeg-1010",
+        "ffmpeg-1011",
+    ):
+        (browsers / name).mkdir()
+    # Служебные и неподходящие под шаблон каталоги не трогаем.
+    (browsers / ".links").mkdir()
+    (browsers / "no-revision").mkdir()
+
+    removed = cleanup_stale_playwright_browsers(browsers, "test", log=False)
+
+    assert removed == 3
+    assert not (browsers / "chromium-1200").exists()
+    assert not (browsers / "chromium_headless_shell-1200").exists()
+    assert not (browsers / "ffmpeg-1010").exists()
+    assert (browsers / "chromium-1208").exists()
+    assert (browsers / "chromium_headless_shell-1208").exists()
+    assert (browsers / "ffmpeg-1011").exists()
+    assert (browsers / ".links").exists()
+    assert (browsers / "no-revision").exists()
+
+
+def test_cleanup_stale_playwright_browsers_missing_dir_is_safe(tmp_path: Path) -> None:
+    missing = tmp_path / "does-not-exist"
+    assert cleanup_stale_playwright_browsers(missing, "test", log=False) == 0
 
 
 def test_close_browser_session_removes_user_data_dir_on_skip_kill(tmp_path: Path) -> None:

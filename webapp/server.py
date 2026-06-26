@@ -188,10 +188,43 @@ def _coerce_card_defaults(stored: dict[str, str]) -> dict[str, object]:
     return result
 
 
+def _app_dir() -> Path:
+    return Path(os.environ.get("SHAGTEAMPRO_APP_DIR", Path.home() / ".shagteampro"))
+
+
 def _database_path() -> Path:
-    app_dir = Path(os.environ.get("SHAGTEAMPRO_APP_DIR", Path.home() / ".shagteampro"))
+    app_dir = _app_dir()
     app_dir.mkdir(parents=True, exist_ok=True)
     return app_dir / "shagteampro.db"
+
+
+_IMPORT_TMP_PREFIX = "import-"
+_IMPORT_TMP_MAX_AGE_SEC = 3600.0
+
+
+def _import_tmp_dir() -> Path:
+    """Каталог для временных файлов импорта внутри пользовательской папки приложения."""
+    tmp_dir = _app_dir() / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    return tmp_dir
+
+
+def _sweep_stale_import_temp_files() -> None:
+    """Удаляет осиротевшие файлы импорта, оставшиеся после аварийного завершения."""
+    try:
+        tmp_dir = _import_tmp_dir()
+        now = datetime.datetime.now().timestamp()
+        for entry in tmp_dir.glob(f"{_IMPORT_TMP_PREFIX}*"):
+            try:
+                if not entry.is_file():
+                    continue
+                if now - entry.stat().st_mtime < _IMPORT_TMP_MAX_AGE_SEC:
+                    continue
+                entry.unlink(missing_ok=True)
+            except Exception:
+                continue
+    except Exception:
+        return
 
 
 def build_services(database_path: Path | None = None) -> AppServices:
@@ -525,8 +558,14 @@ def create_app(base_dir: Path | None = None, services: AppServices | None = None
     async def import_keys(card_id: int, file: UploadFile = File(...)) -> dict:
         suffix = Path(file.filename or "keys.xlsx").suffix
         temp_path: Path | None = None
+        _sweep_stale_import_temp_files()
         try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                dir=_import_tmp_dir(),
+                prefix=_IMPORT_TMP_PREFIX,
+                suffix=suffix,
+            ) as tmp:
                 content = await file.read()
                 tmp.write(content)
                 temp_path = Path(tmp.name)
