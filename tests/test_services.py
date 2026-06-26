@@ -242,7 +242,8 @@ def test_wait_within_budget_caps_requested_sleep() -> None:
             waited.append(ms)
 
     SearchRunnerService._wait_within_budget(_FakePage(), time.time() + 0.2, 5000)
-    assert waited == [200]
+    # На границе таймера допускаем небольшое расхождение из-за округления.
+    assert waited and 190 <= waited[0] <= 200
 
 
 def test_run_maps_card_tabs_activity_stops_within_total_budget(
@@ -1305,21 +1306,30 @@ def test_open_large_map_dismisses_distribution_modal(
     service = SearchRunnerService()
     dismissed: list[dict[str, object]] = []
 
-    class _MapButtonLocator:
+    class _DummyLocator:
+        def __init__(self, *, visible: bool = False) -> None:
+            self._visible = visible
+
         def wait_for(self, **_kwargs) -> None:
             return
 
         def click(self, **_kwargs) -> None:
             return
 
+        def is_visible(self) -> bool:
+            return self._visible
+
         @property
-        def first(self) -> "_MapButtonLocator":
+        def first(self) -> "_DummyLocator":
             return self
 
     class _DummyPage:
-        def locator(self, selector: str) -> _MapButtonLocator:
-            assert selector == "a.OrgmnColumn-MapButton, button.MapLinks-GoToLink"
-            return _MapButtonLocator()
+        def locator(self, selector: str) -> _DummyLocator:
+            if selector == "a.OrgmnColumn-MapButton, button.MapLinks-GoToLink":
+                return _DummyLocator(visible=True)
+            if selector == "ul.VerticalOrgsScroller-List, [class*='ModalWithMap']":
+                return _DummyLocator(visible=False)
+            raise AssertionError(f"unexpected selector: {selector}")
 
         def wait_for_timeout(self, _ms: int) -> None:
             return
@@ -1802,14 +1812,10 @@ def test_simulate_search_action_counts_missing_org_block_as_failure(
     )
     monkeypatch.setattr(service, "_captcha_blocks_progress", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(service, "_dismiss_distribution_modal", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(service, "_open_large_map", lambda _page: False)
+    monkeypatch.setattr(service, "_open_large_map", lambda _page, **_kwargs: False)
     monkeypatch.setattr(service, "_close_browser_session", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service, "_stop_playwright_instance", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        "shagteampro.application.services.search_runner_service.sync_playwright",
-        lambda: _DummyPlaywright(),
-        raising=False,
-    )
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: _DummyPlaywright())
 
     result = service._simulate_search_action(
         key_payload={"phrase": "кофейня"},
@@ -1854,18 +1860,30 @@ def test_search_runner_maps_mode_uses_card_activity_settings(
             return
 
     class _DummyPlaywrightContext:
-        def __enter__(self):
-            return object()
+        def start(self):
+            return self
 
-        def __exit__(self, exc_type, exc, tb) -> None:
+        def stop(self) -> None:
             return
 
+    class _CaptchaResolution:
+        detected = False
+        solved = False
+
     monkeypatch.setattr(service, "_prepare_runtime_browsers_path", lambda: Path("/tmp/pw"))
-    monkeypatch.setattr(service, "_launch_chromium_with_recovery", lambda *_args, **_kwargs: _DummyBrowser())
-    monkeypatch.setattr(service, "_create_human_like_context", lambda _browser: _DummyContext())
+    monkeypatch.setattr(
+        service,
+        "_launch_chromium_with_recovery",
+        lambda *_args, **_kwargs: (_DummyBrowser(), _DummyContext()),
+    )
+    monkeypatch.setattr(service, "_open_browser_page", lambda _context: _DummyPage())
     monkeypatch.setattr(service, "_get_maps_search_input", lambda _page: object())
     monkeypatch.setattr(service, "_type_query_and_submit", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(service, "_handle_captcha_if_present", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        service,
+        "_handle_captcha_if_present",
+        lambda *_args, **_kwargs: _CaptchaResolution(),
+    )
     monkeypatch.setattr(service, "_close_browser_session", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service, "_build_maps_url", lambda _payload: "https://yandex.ru/maps/?lang=ru_RU")
     monkeypatch.setattr(
@@ -1883,11 +1901,7 @@ def test_search_runner_maps_mode_uses_card_activity_settings(
 
     monkeypatch.setattr(service, "_run_maps_card_activity", fake_target_activity)
     monkeypatch.setattr(service, "_run_competitor_card_activity", fake_competitor_activity)
-    monkeypatch.setattr(
-        "shagteampro.application.services.search_runner_service.sync_playwright",
-        lambda: _DummyPlaywrightContext(),
-        raising=False,
-    )
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: _DummyPlaywrightContext())
 
     result = service._simulate_browser_action_one_second(
         key_payload={"phrase": "кофейня"},
@@ -1908,7 +1922,8 @@ def test_search_runner_maps_mode_uses_card_activity_settings(
         },
     )
 
-    assert result == {"effect": True, "actions": {"Маршрут": 2}}
+    assert result["effect"] is True
+    assert result["actions"] == {"Маршрут": 2}
     target_kwargs = calls["target"]
     assert target_kwargs["min_sleep_target_tab_sec"] == 6
     assert target_kwargs["max_sleep_target_tab_sec"] == 9

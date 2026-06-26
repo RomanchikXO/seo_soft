@@ -136,6 +136,15 @@ class YandexOrgAutofillRequest(BaseModel):
     url: str
 
 
+_CLICK_LABELS_BY_SHORT = {
+    "tel": "Показать телефон",
+    "site": "Сайт",
+    "route": "Маршрут",
+    "msg": "мессенджер",
+    "story": "Записаться",
+}
+
+
 def _coerce_card_settings(settings: dict[str, str]) -> dict[str, object]:
     defaults = CardSettingsRequest().model_dump()
     result: dict[str, object] = dict(defaults)
@@ -249,6 +258,97 @@ def _build_optimization_cards_payload(
     return cards_payload
 
 
+def _build_interrupted_optimization_summary(
+    snapshot: dict[str, object] | None,
+    cards_payload: list[dict[str, object]],
+    *,
+    started_at: datetime.datetime,
+    finished_at: datetime.datetime,
+) -> dict[str, object]:
+    """Собирает стандартный summary по частичным данным при прерывании запуска."""
+    typed_snapshot = snapshot if isinstance(snapshot, dict) else {}
+    cards_by_id = {
+        int(card.get("card_id", 0)): card
+        for card in cards_payload
+        if int(card.get("card_id", 0) or 0) > 0
+    }
+    snapshot_cards_raw = typed_snapshot.get("cards", [])
+    snapshot_cards = snapshot_cards_raw if isinstance(snapshot_cards_raw, list) else []
+    progress_by_id = {
+        int(item.get("card_id", 0)): item
+        for item in snapshot_cards
+        if isinstance(item, dict) and int(item.get("card_id", 0) or 0) > 0
+    }
+
+    total_action_counts: dict[str, int] = {}
+    summary_cards: list[dict[str, object]] = []
+    for card_id in sorted(cards_by_id):
+        payload = cards_by_id[card_id]
+        progress = progress_by_id.get(card_id, {})
+
+        search_target = int(payload.get("search_target", 0) or 0)
+        maps_target = int(payload.get("maps_target", 0) or 0)
+        search_performed = max(0, min(search_target, int(progress.get("search_performed", 0) or 0)))
+        maps_performed = max(0, min(maps_target, int(progress.get("maps_performed", 0) or 0)))
+        card_failures = max(0, int(progress.get("failures", 0) or 0))
+
+        # В snapshot нет разбивки failures по режимам, поэтому оцениваем их по остаткам целей.
+        remaining_search = max(0, search_target - search_performed)
+        search_failures = min(card_failures, remaining_search)
+        maps_failures = max(0, card_failures - search_failures)
+
+        raw_clicks = progress.get("clicks")
+        typed_clicks = raw_clicks if isinstance(raw_clicks, dict) else {}
+        maps_action_counts = {
+            label: int(typed_clicks.get(short, 0) or 0)
+            for short, label in _CLICK_LABELS_BY_SHORT.items()
+        }
+        maps_action_counts = {key: value for key, value in maps_action_counts.items() if value > 0}
+        for action_label, count in maps_action_counts.items():
+            total_action_counts[action_label] = total_action_counts.get(action_label, 0) + int(count)
+
+        summary_cards.append(
+            {
+                "card_id": card_id,
+                "card_name": str(payload.get("card_name") or "Без названия"),
+                "organization": str(payload.get("organization") or ""),
+                "search_target": search_target,
+                "search_performed": search_performed,
+                "maps_target": maps_target,
+                "maps_performed": maps_performed,
+                "search_failures": search_failures,
+                "maps_failures": maps_failures,
+                "search_effect_keys": [],
+                "maps_effect_keys": [],
+                "maps_action_counts": maps_action_counts,
+                "key_failure_reports": [],
+                "exhausted_keys": [],
+            }
+        )
+
+    total_search_target = sum(int(card.get("search_target", 0) or 0) for card in summary_cards)
+    total_search_performed = sum(int(card.get("search_performed", 0) or 0) for card in summary_cards)
+    total_maps_target = sum(int(card.get("maps_target", 0) or 0) for card in summary_cards)
+    total_maps_performed = sum(int(card.get("maps_performed", 0) or 0) for card in summary_cards)
+
+    return {
+        "processed_cards": len(summary_cards),
+        "total_search_target": total_search_target,
+        "total_search_performed": total_search_performed,
+        "total_maps_target": total_maps_target,
+        "total_maps_performed": total_maps_performed,
+        "total_failed_attempts": int(typed_snapshot.get("total_failed_attempts", 0) or 0),
+        "total_action_counts": total_action_counts,
+        "key_failure_reports": [],
+        "exhausted_keys": [],
+        "cards": summary_cards,
+        "stopped_by_user": bool(typed_snapshot.get("stopped_by_user")),
+        "started_at": started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "duration_seconds": (finished_at - started_at).total_seconds(),
+    }
+
+
 def _run_optimization_worker(
     resolved_services: AppServices,
     cards_payload: list[dict[str, object]],
@@ -273,8 +373,26 @@ def _run_optimization_worker(
                 resolved_services.notification_service.notify_optimization_finished(summary)
             except Exception:
                 pass
-    except Exception as error:
-        finish_run(run_id, error=str(error))
+    except BaseException as error:
+        # Любое прерывание сопровождаем стандартной итоговой статистикой в Telegram.
+        finished_at = datetime.datetime.now()
+        reason = str(error) or type(error).__name__
+        finish_run(run_id, error=reason)
+
+        if resolved_services.notification_service is not None:
+            try:
+                snapshot = get_run_snapshot(run_id)
+                summary = _build_interrupted_optimization_summary(
+                    snapshot,
+                    cards_payload,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                )
+                resolved_services.notification_service.notify_optimization_finished(summary)
+            except Exception:
+                pass
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
 
 
 def create_app(base_dir: Path | None = None, services: AppServices | None = None) -> FastAPI:

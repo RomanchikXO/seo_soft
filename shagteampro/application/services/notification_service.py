@@ -137,7 +137,11 @@ class NotificationService:
 
         completed_cards, partial_cards, idle_cards = NotificationService._count_card_states(typed_cards)
 
-        lines = ["<b>✅ Оптимизация завершена</b>"]
+        if summary.get("stopped_by_user"):
+            header = "<b>🛑 Оптимизация остановлена пользователем</b>"
+        else:
+            header = "<b>✅ Оптимизация завершена</b>"
+        lines = [header]
         if started_display:
             lines.append(f"🟢 Начало работы: <i>{html.escape(started_display)}</i>")
         lines.append(f"🔴 Завершение: <i>{html.escape(finished_display)}</i>")
