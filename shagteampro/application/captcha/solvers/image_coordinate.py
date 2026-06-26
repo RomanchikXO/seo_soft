@@ -147,8 +147,6 @@ class ImageCoordinateCaptchaSolver:
             target_x = x * scale
             target_y = y * scale
             self._log(f"Клик {index}: оригинальные ({x}, {y}) -> масштабированные ({target_x:.1f}, {target_y:.1f})")
-            # force=True обязателен: контейнер силуэт-капчи (.AdvancedCaptcha-ImageWrapper)
-            # перехватывает события указателя, из-за чего обычный клик зависает на 30с.
             main_img_loc.click(position={"x": target_x, "y": target_y}, force=True)
             self._pause_between_captcha_clicks(page)
         return True

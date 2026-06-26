@@ -53,10 +53,13 @@ def _get_run_logger() -> logging.Logger:
     return _run_logger
 
 
+_CHROME_PROFILE_PREFIX = "shagteampro-chrome-"
 _active_user_data_dirs: set[str] = set()
+_pending_delete_user_data_dirs: set[str] = set()
 _active_user_data_dirs_lock = threading.Lock()
-_WINDOWS_PROFILE_DELETE_ATTEMPTS = 5
+_WINDOWS_PROFILE_DELETE_ATTEMPTS = 8
 _PROFILE_DELETE_RETRY_DELAY_SEC = 0.25
+_ORPHAN_PROFILE_MIN_AGE_SEC = 90.0
 _process_exit_cleanup_lock = threading.Lock()
 _process_exit_cleanup_registered = False
 _original_sigint_handler = None
@@ -81,6 +84,14 @@ def _register_user_data_dir(path: str) -> None:
 def _unregister_user_data_dir(path: str) -> None:
     with _active_user_data_dirs_lock:
         _active_user_data_dirs.discard(path)
+        _pending_delete_user_data_dirs.discard(path)
+
+
+def _mark_user_data_dir_pending(path: str) -> None:
+    """Помечает профиль как требующий повторного удаления (rmtree не удался)."""
+    with _active_user_data_dirs_lock:
+        _active_user_data_dirs.add(path)
+        _pending_delete_user_data_dirs.add(path)
 
 
 def _user_data_dir_match_variants(user_data_dir: str) -> tuple[str, ...]:
@@ -151,9 +162,18 @@ def _chmod_and_retry_rmtree(func, path_str: str, _exc_info) -> None:
 
 
 def _remove_user_data_dir_path(path: str, label: str, *, log: bool = True) -> bool:
-    _unregister_user_data_dir(path)
+    """Удаляет временный профиль Chrome с ретраями и снятием блокировок.
+
+    ВАЖНО: путь снимается с учёта (``_unregister_user_data_dir``) ТОЛЬКО при
+    успешном удалении. Если ``rmtree`` не удался (на Windows под нагрузкой файлы
+    профиля ещё залочены процессами Chrome), путь остаётся в реестре и в очереди
+    отложенного удаления, чтобы его повторно подобрали последующие попытки
+    (новый запуск окна, atexit, shutdown, обработчик сигналов). Иначе каталог
+    превращается в «сироту», который уже никто не удалит.
+    """
     profile_path = Path(path)
     if not profile_path.exists():
+        _unregister_user_data_dir(path)
         return True
 
     attempts = _WINDOWS_PROFILE_DELETE_ATTEMPTS if os.name == "nt" else 3
@@ -164,6 +184,7 @@ def _remove_user_data_dir_path(path: str, label: str, *, log: bool = True) -> bo
                 shutil.rmtree(profile_path, onerror=_chmod_and_retry_rmtree)
             else:
                 shutil.rmtree(profile_path)
+            _unregister_user_data_dir(path)
             if log:
                 _log_run_message(f"{label}: удалён временный профиль Chrome: {path}.")
             return True
@@ -174,10 +195,11 @@ def _remove_user_data_dir_path(path: str, label: str, *, log: bool = True) -> bo
             _kill_processes_for_user_data_dir(path)
             time.sleep(_PROFILE_DELETE_RETRY_DELAY_SEC * (attempt + 1))
 
+    _mark_user_data_dir_pending(path)
     if log and last_error is not None:
         _log_run_message(
             f"{label}: не удалось удалить временный профиль Chrome "
-            f"({last_error}): {path}."
+            f"({last_error}): {path}. Каталог оставлен для повторной очистки."
         )
     return False
 
@@ -188,6 +210,62 @@ def cleanup_registered_user_data_dirs(label: str = "emergency", *, log: bool = T
         paths = list(_active_user_data_dirs)
     for path in paths:
         _remove_user_data_dir_path(path, label, log=log)
+
+
+def retry_pending_profile_deletes(label: str = "retry", *, log: bool = False) -> int:
+    """Повторяет удаление профилей, которые ранее не удалось удалить.
+
+    Эти каталоги — подтверждённые «сироты» (их браузер уже завершён), поэтому
+    повторное удаление безопасно из любого потока и не заденет активные окна
+    параллельных прогонов. Вызывается дёшево при каждом запуске нового окна.
+    """
+    with _active_user_data_dirs_lock:
+        paths = list(_pending_delete_user_data_dirs)
+    removed = 0
+    for path in paths:
+        if _remove_user_data_dir_path(path, label, log=log):
+            removed += 1
+    return removed
+
+
+def sweep_orphan_chrome_profiles(label: str = "sweep", *, log: bool = False) -> int:
+    """Удаляет «осиротевшие» профили Chrome из системного TEMP.
+
+    Сюда попадают профили от прошлых аварийно завершённых прогонов (kill
+    процесса, отключение питания, падение приложения). Активные профили текущего
+    процесса (числящиеся в реестре) и слишком свежие каталоги не трогаем.
+    """
+    temp_root = Path(tempfile.gettempdir())
+    try:
+        entries = list(temp_root.glob(f"{_CHROME_PROFILE_PREFIX}*"))
+    except Exception:
+        return 0
+    with _active_user_data_dirs_lock:
+        active = {
+            os.path.normcase(os.path.normpath(item)) for item in _active_user_data_dirs
+        }
+    now = time.time()
+    removed = 0
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+        except Exception:
+            continue
+        normalized = os.path.normcase(os.path.normpath(str(entry)))
+        if normalized in active:
+            continue
+        try:
+            age = now - entry.stat().st_mtime
+        except Exception:
+            age = _ORPHAN_PROFILE_MIN_AGE_SEC + 1
+        if age < _ORPHAN_PROFILE_MIN_AGE_SEC:
+            continue
+        if _remove_user_data_dir_path(str(entry), label, log=log):
+            removed += 1
+    if removed and log:
+        _log_run_message(f"{label}: удалено осиротевших профилей Chrome: {removed}.")
+    return removed
 
 
 def _atexit_cleanup() -> None:
@@ -209,6 +287,10 @@ def ensure_process_exit_cleanup() -> None:
             return
         _process_exit_cleanup_registered = True
         atexit.register(_atexit_cleanup)
+        try:
+            sweep_orphan_chrome_profiles("startup", log=False)
+        except Exception:
+            pass
         if threading.current_thread() is not threading.main_thread():
             return
         _original_sigint_handler = signal.getsignal(signal.SIGINT)
@@ -228,7 +310,6 @@ class _ActionBudget:
     выполненных действий по каждому типу не может превысить заданный лимит.
     """
 
-    # Порядок целевых действий в плане одного перехода карты.
     ACTION_ORDER: tuple[str, ...] = (
         "Показать телефон",
         "Сайт",
@@ -361,8 +442,6 @@ class SearchRunnerService:
             browser, context = self._launch_chromium_with_recovery(playwright, browsers_path)
             page = self._open_browser_page(context)
             for query in queries:
-                # Каждый запрос изолирован: ошибка/ручное закрытие браузера на одном
-                # запросе не должны рушить весь пакетный прогон.
                 try:
                     if not self._is_page_alive(page):
                         self._log("run_yandex_searches: страница/браузер недоступны, пересоздаю сессию.")
@@ -453,12 +532,18 @@ class SearchRunnerService:
             targets=targets,
             card_results=card_results,
         )
-        self._run_targets_in_pool(
-            targets,
-            max_workers,
-            card_results=card_results,
-            progress_run_id=progress_run_id,
-        )
+        try:
+            self._run_targets_in_pool(
+                targets,
+                max_workers,
+                card_results=card_results,
+                progress_run_id=progress_run_id,
+            )
+        finally:
+            try:
+                retry_pending_profile_deletes("post-run", log=True)
+            except Exception:
+                pass
         for state in targets:
             self._apply_target_state(card_results[state["card_id"]], state)
 
@@ -534,7 +619,6 @@ class SearchRunnerService:
                         "in_flight": 0,
                         "effect_key_ids": set(),
                         "action_counts": {},
-                        # Бюджет целевых действий общий на все переходы карты этой карточки.
                         "action_budget": self._build_action_budget(card_payload) if mode == "maps" else None,
                     }
                 )
@@ -929,7 +1013,6 @@ class SearchRunnerService:
             ]
             card_entry["exhausted_keys"] = preserved + list(exhausted_records)
         if mode == "maps":
-            # state["action_counts"] уже накопительный итог по цели maps — не суммируем повторно.
             card_entry["maps_action_counts"] = dict(state.get("action_counts", {}))
 
     def _build_optimization_summary(self, card_results: dict[int, dict[str, object]]) -> dict[str, object]:
@@ -1154,7 +1237,6 @@ class SearchRunnerService:
         ".Modal-Content > .OneOrgModal-CloseButton",
     )
 
-    # Вкладки карточки организации на Яндекс.Картах (класс _name_* + подпись).
     _MAPS_CARD_TAB_SPECS: tuple[tuple[str, str], ...] = (
         ("overview", "Обзор"),
         ("menu", "Меню"),
@@ -1164,8 +1246,6 @@ class SearchRunnerService:
         ("features", "Особенности"),
     )
 
-    # Fallback: ищем кнопку закрытия строго внутри оверлея просмотрщика фото,
-    # чтобы случайно не закрыть всю карточку организации или карту.
     _CLOSE_MEDIA_VIEWER_JS: str = """
         () => {
             const viewers = Array.from(
@@ -1637,8 +1717,6 @@ class SearchRunnerService:
 
         sleep_time_sec = random.randint(min_sleep_overview, max_sleep_overview)
         self._log(f"simulate_search_action: имитация активности в карточке {sleep_time_sec} сек.")
-        # Внутри модалки карты НЕ жмём Esc и не кликаем «Нет, спасибо» —
-        # это закрыло бы саму карту. Гасим только промо-сплэш через JS.
         self._remove_distribution_overlays(page)
         end_time = page.evaluate("Date.now()") + (sleep_time_sec * 1000)
         visited_sections: set[str] = set()
@@ -1682,7 +1760,6 @@ class SearchRunnerService:
     def _browse_photo_section(self, page, visited_sections: set[str]) -> None:
         """Открывает блок фото, рассматривает отдельные снимки и закрывает блок."""
         try:
-            # Плитка/кнопка в карточке, открывающая блок «Фото и видео».
             opener = page.locator(
                 ".PhotoTiles-More button, .OrgGallery-PhotoTiles .PhotoTiles-Item, "
                 ".OrgGallery .PhotoTiles-Item, .PhotoTiles-Item"
@@ -1703,8 +1780,6 @@ class SearchRunnerService:
             page.wait_for_timeout(random.randint(1500, 3000))
 
             self._scroll_photo_gallery(page)
-            # Обязательно закрываем сам блок фото (оверлей OneOrgModal),
-            # чтобы вернуться к карточке организации.
             self._close_photo_overlay(page, section_start)
         except Exception:
             return
@@ -1717,7 +1792,6 @@ class SearchRunnerService:
         for step in range(scroll_steps):
             self._scroll_visible_content(page, random.randint(200, 600))
             page.wait_for_timeout(random.randint(2000, 4000))
-            # Часть проходов открываем конкретное фото и закрываем лайтбокс.
             if step == 0 or random.random() < 0.5:
                 self._open_random_gallery_photo(page, opened)
 
@@ -1731,8 +1805,6 @@ class SearchRunnerService:
             if count <= 0:
                 self._log("Не нашёл отдельных фотографий для увеличения.")
                 return
-            # Выбираем индекс, который ещё не открывали, чтобы не кликать
-            # повторно по одному и тому же снимку.
             limit = min(count, 14)
             candidates = [i for i in range(limit) if opened is None or i not in opened]
             if not candidates:
@@ -1786,8 +1858,6 @@ class SearchRunnerService:
                     return
             except Exception:
                 continue
-        # Запасной путь: ищем кнопку закрытия прямо внутри оверлея просмотрщика
-        # (тема fiji и др.), не задевая кнопку закрытия карточки/карты.
         try:
             if page.evaluate(self._CLOSE_MEDIA_VIEWER_JS):
                 self._log("Закрыл увеличенное фото кнопкой внутри просмотрщика (JS).")
@@ -1905,8 +1975,6 @@ class SearchRunnerService:
         max_sleep_target_tab_sec = self._to_non_negative_int(card_payload.get("max_sleep_target_tab_sec", 0))
         if max_sleep_target_tab_sec < min_sleep_target_tab_sec:
             max_sleep_target_tab_sec = min_sleep_target_tab_sec
-        # Если бюджет не передан (например, прямой вызов), считаем лимиты только
-        # для этого перехода из настроек карточки.
         if action_budget is None:
             action_budget = self._build_action_budget(card_payload)
         self._log(f"simulate_maps_action: старт для запроса '{query}'.")
@@ -2109,7 +2177,6 @@ class SearchRunnerService:
                 max_sleep_target_tab_sec=max_sleep_target_tab_sec,
             )
             performed = max(0, int(performed or 0))
-            # Возвращаем в бюджет зарезервированные, но не выполненные клики.
             action_budget.settle(action_label, reserved=attempts, performed=performed)
             if performed:
                 action_counts[action_label] = action_counts.get(action_label, 0) + performed
@@ -2352,7 +2419,6 @@ class SearchRunnerService:
                 )
                 after_count = self._count_show_phone_controls(page)
                 visible_phone_after = self._count_visible_phone_values(page)
-                # Успех: контрол раскрылся, либо телефон уже был видим и клик выполнен.
                 if (
                     after_count < before_count
                     or visible_phone_after > visible_phone_before
@@ -2492,7 +2558,6 @@ class SearchRunnerService:
         self._log(f"simulate_maps_action: клики в мессенджеры выполнены {success}/{attempts}.")
         return success
 
-    # Текстовые исключения для не-CTA действий (Маршрут/Показать телефон тоже имеют action-button-view__icon).
     _NON_CTA_TEXT_EXCLUDES = ":not(:has-text('Маршрут')):not(:has-text('Показать телефон'))"
 
     @staticmethod
@@ -2500,14 +2565,12 @@ class SearchRunnerService:
         """Locator CTA-кнопки заведения (Забронировать/Заказать/Записаться) с приоритетом точных признаков."""
         excludes = SearchRunnerService._NON_CTA_TEXT_EXCLUDES
 
-        # 1) Точный контейнер призыва к действию — только CTA-кнопки заведения.
         container_locator = page.locator(
             ".business-card-title-view__call-to-action [role='button']"
         )
         if container_locator.count() > 0:
             return container_locator
 
-        # 2) Стиль "announcement" — устойчивый признак CTA (в отличие от _view_primary у "Маршрут").
         announcement_locator = page.locator(
             "button._view_announcement[role='button'], a._view_announcement[role='button'], "
             "button._view_announcement, a._view_announcement"
@@ -2515,7 +2578,6 @@ class SearchRunnerService:
         if announcement_locator.count() > 0:
             return announcement_locator
 
-        # 3) Якорь на иконку action-button, но исключая стандартные не-CTA действия.
         icon_locator = page.locator(
             f"button:has(.action-button-view__icon){excludes}, "
             f"a:has(.action-button-view__icon){excludes}, "
@@ -2524,14 +2586,12 @@ class SearchRunnerService:
         if icon_locator.count() > 0:
             return icon_locator
 
-        # 4) Семантический фолбэк по внешней ссылке-кнопке (исключая сайт/мессенджеры).
         semantic_locator = page.locator(
             "a[role='button'][target='_blank'][rel*='nofollow']:not([itemprop='url']):not([itemprop='sameAs'])"
         )
         if semantic_locator.count() > 0:
             return semantic_locator
 
-        # 5) Широкий фолбэк по кнопке, исключая явные не-CTA действия.
         return page.locator(f"button[role='button']{excludes}")
 
     def _perform_maps_cta_clicks(
@@ -3259,8 +3319,16 @@ class SearchRunnerService:
     def _launch_human_like_session(self, playwright):
         """Запускает изолированный Chrome/Chromium через persistent context."""
         ensure_process_exit_cleanup()
-        user_data_dir = tempfile.mkdtemp(prefix="shagteampro-chrome-")
+        retry_pending_profile_deletes()
+        user_data_dir = tempfile.mkdtemp(prefix=_CHROME_PROFILE_PREFIX)
         _register_user_data_dir(user_data_dir)
+        try:
+            return self._launch_persistent_session(playwright, user_data_dir)
+        except Exception:
+            _remove_user_data_dir_path(user_data_dir, "launch-failed", log=False)
+            raise
+
+    def _launch_persistent_session(self, playwright, user_data_dir: str):
         launch_kwargs = {
             "headless": False,
             "no_viewport": True,

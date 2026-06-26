@@ -13,7 +13,10 @@ from shagteampro.application.services.search_runner_service import (
     SearchRunnerService,
     _register_user_data_dir,
     cleanup_registered_user_data_dirs,
+    retry_pending_profile_deletes,
+    sweep_orphan_chrome_profiles,
 )
+import shagteampro.application.services.search_runner_service as _srs
 from shagteampro.application.services.settings_service import SettingsService
 from shagteampro.application.services.yandex_organization_service import YandexOrganizationService
 from shagteampro.infrastructure.parsers.yandex_organization_parser import YandexOrganizationParser
@@ -242,7 +245,6 @@ def test_wait_within_budget_caps_requested_sleep() -> None:
             waited.append(ms)
 
     SearchRunnerService._wait_within_budget(_FakePage(), time.time() + 0.2, 5000)
-    # На границе таймера допускаем небольшое расхождение из-за округления.
     assert waited and 190 <= waited[0] <= 200
 
 
@@ -336,7 +338,6 @@ def test_apply_target_state_does_not_double_count_maps_clicks() -> None:
     service._apply_target_state(card_entry, state)
     assert card_entry["maps_action_counts"] == {"Показать телефон": 1, "Сайт": 1}
 
-    # Повторный вызов при обновлении прогресса не должен раздувать счётчики.
     service._apply_target_state(card_entry, state)
     assert card_entry["maps_action_counts"] == {"Показать телефон": 1, "Сайт": 1}
 
@@ -627,7 +628,6 @@ def test_notification_renders_target_action_totals() -> None:
     assert "📞 Показать телефон: <b>1</b>" in text
     assert "🧭 Маршрут: <b>2</b>" in text
     assert "💬 Мессенджеры: <b>3</b>" in text
-    # Поиск не включался — не должен числиться как «не выполнено».
     assert "Не удалось выполнить" not in text
 
 
@@ -857,8 +857,6 @@ def test_dismiss_distribution_modal_clicks_close_button_and_always_presses_escap
 
     service._dismiss_distribution_modal(page, context="overview")
 
-    # Клик по кнопке закрытия выполнен, JS-удаление не понадобилось,
-    # но Esc всё равно жмётся 3 раза как страховка.
     assert page.clicks == [True]
     assert page.evaluated == []
     assert page.keyboard.pressed == ["Escape", "Escape", "Escape"]
@@ -1025,6 +1023,69 @@ def test_cleanup_registered_user_data_dirs_removes_tracked_paths(
     assert not profile_dir.exists()
 
 
+def test_failed_delete_keeps_profile_registered_for_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_dir = tmp_path / "shagteampro-chrome-locked"
+    profile_dir.mkdir()
+    _register_user_data_dir(str(profile_dir))
+    monkeypatch.setattr(_srs, "_kill_processes_for_user_data_dir", lambda *_a, **_k: None)
+    monkeypatch.setattr(_srs.time, "sleep", lambda *_a, **_k: None)
+
+    calls = {"n": 0}
+    real_rmtree = _srs.shutil.rmtree
+
+    def flaky_rmtree(path, *args, **kwargs):
+        calls["n"] += 1
+        if calls["phase"] == 1:
+            raise PermissionError("locked")
+        return real_rmtree(path, *args, **kwargs)
+
+    calls["phase"] = 1
+    monkeypatch.setattr(_srs.shutil, "rmtree", flaky_rmtree)
+
+    assert _srs._remove_user_data_dir_path(str(profile_dir), "test", log=False) is False
+    with _srs._active_user_data_dirs_lock:
+        assert str(profile_dir) in _srs._active_user_data_dirs
+        assert str(profile_dir) in _srs._pending_delete_user_data_dirs
+    assert profile_dir.exists()
+
+    calls["phase"] = 2
+    assert retry_pending_profile_deletes("test", log=False) == 1
+    assert not profile_dir.exists()
+    with _srs._active_user_data_dirs_lock:
+        assert str(profile_dir) not in _srs._active_user_data_dirs
+        assert str(profile_dir) not in _srs._pending_delete_user_data_dirs
+
+
+def test_sweep_orphan_chrome_profiles_removes_stale_temp_dirs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_srs.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setattr(_srs, "_kill_processes_for_user_data_dir", lambda *_a, **_k: None)
+    monkeypatch.setattr(_srs.time, "sleep", lambda *_a, **_k: None)
+
+    orphan = tmp_path / "shagteampro-chrome-orphan"
+    orphan.mkdir()
+    (orphan / "lock").write_text("x")
+    fresh = tmp_path / "shagteampro-chrome-fresh"
+    fresh.mkdir()
+    unrelated = tmp_path / "some-other-tmp"
+    unrelated.mkdir()
+
+    old_mtime = _srs.time.time() - 10_000
+    _srs.os.utime(orphan, (old_mtime, old_mtime))
+
+    removed = sweep_orphan_chrome_profiles("test", log=False)
+
+    assert removed == 1
+    assert not orphan.exists()
+    assert fresh.exists()
+    assert unrelated.exists()
+
+
 def test_close_browser_session_removes_user_data_dir_on_skip_kill(tmp_path: Path) -> None:
     service = SearchRunnerService()
     profile_dir = tmp_path / "shagteampro-chrome-test"
@@ -1096,7 +1157,6 @@ def test_close_photo_viewer_does_not_press_escape_when_button_absent() -> None:
 
     service._close_photo_viewer(page)
 
-    # Внутри модалки карты Esc запрещён — он закрыл бы всю карточку.
     assert page.clicks == []
     assert page.keyboard.pressed == []
 
@@ -1565,7 +1625,6 @@ def test_search_runner_browser_close_does_not_consume_failure_budget(
 ) -> None:
     service = SearchRunnerService()
     monkeypatch.setattr(service, "ensure_chromium_installed", lambda: False)
-    # Сначала несколько закрытий браузера (без штрафа), затем успешные переходы.
     outcomes = iter(
         [
             {"effect": False, "actions": {}, "closed": True},
@@ -1927,7 +1986,6 @@ def test_search_runner_maps_mode_uses_card_activity_settings(
     target_kwargs = calls["target"]
     assert target_kwargs["min_sleep_target_tab_sec"] == 6
     assert target_kwargs["max_sleep_target_tab_sec"] == 9
-    # Лимиты целевых действий приходят как суммарный бюджет карточки.
     assert target_kwargs["action_budget"].snapshot() == {
         "Показать телефон": 2,
         "Сайт": 1,
@@ -2161,7 +2219,6 @@ def test_search_runner_cta_locator_prefers_announcement_over_route_icon() -> Non
     class _FakePage:
         def locator(self, selector: str):
             selectors.append(selector)
-            # Контейнера call-to-action нет, но есть announcement-кнопка.
             if "call-to-action" in selector:
                 return _FakeLocator(0)
             if "_view_announcement" in selector:
@@ -2170,7 +2227,6 @@ def test_search_runner_cta_locator_prefers_announcement_over_route_icon() -> Non
 
     chosen = SearchRunnerService._maps_cta_locator(_FakePage())
     assert chosen.count() == 1
-    # Иконочный широкий фолбэк не должен быть выбран раньше announcement.
     assert any("_view_announcement" in selector for selector in selectors)
     assert "action-button-view__icon" not in selectors[-1]
 
@@ -2264,7 +2320,6 @@ def test_search_runner_phone_clicks_accept_when_phone_already_visible(
 def test_search_runner_budgeted_plan_reserves_and_shuffles(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Бюджет: телефон=2, сайт=3, маршрут=2. randint резервирует 1, 0, 2 соответственно.
     from shagteampro.application.services.search_runner_service import _ActionBudget
 
     call_values = iter([1, 0, 2])
@@ -2283,7 +2338,6 @@ def test_search_runner_budgeted_plan_reserves_and_shuffles(
     plan = SearchRunnerService._build_budgeted_maps_action_plan(budget)
 
     assert plan == [("Маршрут", 2), ("Показать телефон", 1)]
-    # Зарезервированное вычтено из общего бюджета карточки.
     assert budget.snapshot() == {"Показать телефон": 1, "Сайт": 3, "Маршрут": 0}
 
 
@@ -2292,7 +2346,6 @@ def test_search_runner_budgeted_plan_empty_when_nothing_reserved(
 ) -> None:
     from shagteampro.application.services.search_runner_service import _ActionBudget
 
-    # Каждое действие резервирует 0 — план может быть пустым (это допустимо).
     monkeypatch.setattr(
         "shagteampro.application.services.search_runner_service.random.randint",
         lambda _a, _b: 0,
@@ -2313,8 +2366,6 @@ def test_search_runner_budget_total_never_exceeds_limit(
 ) -> None:
     from shagteampro.application.services.search_runner_service import _ActionBudget
 
-    # Имитируем 100 переходов карты: каждый раз резервируем и считаем "выполнено"
-    # ровно столько, сколько зарезервировано (без возвратов). Суммарно не больше лимита.
     budget = _ActionBudget(
         {"Показать телефон": 1, "Сайт": 1, "Маршрут": 1, "мессенджер": 1, "Записаться": 1}
     )

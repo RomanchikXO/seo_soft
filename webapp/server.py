@@ -292,7 +292,6 @@ def _build_interrupted_optimization_summary(
         maps_performed = max(0, min(maps_target, int(progress.get("maps_performed", 0) or 0)))
         card_failures = max(0, int(progress.get("failures", 0) or 0))
 
-        # В snapshot нет разбивки failures по режимам, поэтому оцениваем их по остаткам целей.
         remaining_search = max(0, search_target - search_performed)
         search_failures = min(card_failures, remaining_search)
         maps_failures = max(0, card_failures - search_failures)
@@ -374,7 +373,6 @@ def _run_optimization_worker(
             except Exception:
                 pass
     except BaseException as error:
-        # Любое прерывание сопровождаем стандартной итоговой статистикой в Telegram.
         finished_at = datetime.datetime.now()
         reason = str(error) or type(error).__name__
         finish_run(run_id, error=reason)

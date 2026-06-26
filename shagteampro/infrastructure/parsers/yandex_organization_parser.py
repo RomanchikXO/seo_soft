@@ -189,7 +189,6 @@ class YandexOrganizationParser:
         if ll_values:
             return YandexOrganizationParser._normalize_ll(ll_values[0])
 
-        # Иногда параметры карты оказываются во fragment после '#'
         fragment = parsed.fragment
         if fragment:
             fragment_pairs = parse_qs(fragment)

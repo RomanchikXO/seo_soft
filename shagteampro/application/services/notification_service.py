@@ -377,7 +377,6 @@ class NotificationService:
             lines.append(f"• <b>{title}</b>: {label} {done}/{target}{percent}{keys_suffix}")
         return lines
 
-    # Порядок и подписи целевых действий для статистики в уведомлении.
     _ACTION_DISPLAY: list[tuple[str, str]] = [
         ("Показать телефон", "📞 Показать телефон"),
         ("Сайт", "🌐 Сайт"),
