@@ -264,6 +264,67 @@ def test_api_optimization_run_uses_selected_cards_and_flags(tmp_path: Path) -> N
         assert bad_response.status_code in (400, 422)
 
 
+def test_api_optimization_run_search_only_mode(tmp_path: Path) -> None:
+    services = build_services(database_path=tmp_path / "api.db")
+    stub_runner = StubSearchRunner()
+    stub_yandex_org = StubYandexOrganizationService()
+    services = AppServices(
+        card_service=services.card_service,
+        key_service=services.key_service,
+        import_service=services.import_service,
+        settings_service=services.settings_service,
+        search_runner_service=stub_runner,
+        yandex_organization_service=stub_yandex_org,
+    )
+    base_dir = Path(__file__).resolve().parents[1] / "webapp"
+    app = create_app(base_dir=base_dir, services=services)
+
+    with TestClient(app) as client:
+        card_id = client.post("/api/cards", json={"name": "Card"}).json()["id"]
+        search_key_id = client.post(
+            f"/api/cards/{card_id}/keys", json={"phrase": "search key"}
+        ).json()["id"]
+        maps_key_id = client.post(
+            f"/api/cards/{card_id}/keys", json={"phrase": "maps key"}
+        ).json()["id"]
+        both_key_id = client.post(
+            f"/api/cards/{card_id}/keys", json={"phrase": "both key"}
+        ).json()["id"]
+        client.patch(f"/api/keys/{search_key_id}/targets", json={"search_enabled": True})
+        client.patch(f"/api/keys/{maps_key_id}/targets", json={"maps_enabled": True})
+        client.patch(
+            f"/api/keys/{both_key_id}/targets",
+            json={"search_enabled": True, "maps_enabled": True},
+        )
+        client.post(
+            f"/api/cards/{card_id}/settings",
+            json={"search_transitions": 3, "maps_transitions": 4},
+        )
+
+        response = client.post(
+            "/api/optimization/run",
+            json={"card_ids": [card_id], "threads": 2, "mode": "search"},
+        )
+        assert response.status_code == 200
+
+        for _ in range(50):
+            status = client.get(f"/api/optimization/status/{response.json()['run_id']}").json()
+            if status["status"] in {"done", "error"}:
+                break
+            time.sleep(0.01)
+
+        assert len(stub_runner.optimization_calls) == 1
+        cards_payload, _ = stub_runner.optimization_calls[0]
+        card_payload = cards_payload[0]
+        assert card_payload["search_target"] == 3
+        assert card_payload["maps_target"] == 0
+        keys_by_phrase = {key["phrase"]: key for key in card_payload["keys"]}
+        assert keys_by_phrase["search key"]["search_enabled"] is True
+        assert keys_by_phrase["both key"]["search_enabled"] is True
+        for key in card_payload["keys"]:
+            assert key["maps_enabled"] is False
+
+
 def test_api_yandex_org_autofill(tmp_path: Path) -> None:
     services = build_services(database_path=tmp_path / "api.db")
     stub_runner = StubSearchRunner()

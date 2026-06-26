@@ -6,6 +6,7 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -130,6 +131,7 @@ class SettingsRequest(BaseModel):
 class OptimizationRunRequest(BaseModel):
     card_ids: list[int]
     threads: int = Field(default=1, ge=1, le=50)
+    mode: Literal["default", "search", "maps"] = "default"
 
 
 class YandexOrgAutofillRequest(BaseModel):
@@ -255,6 +257,36 @@ def _build_optimization_cards_payload(
                 ],
             }
         )
+    return cards_payload
+
+
+def _apply_optimization_mode(
+    cards_payload: list[dict[str, object]],
+    mode: str,
+) -> list[dict[str, object]]:
+    """Ограничивает оптимизацию выбранным режимом.
+
+    - ``search``: выполняется только поиск, цель по картам обнуляется, а у ключей
+      снимается признак карт, чтобы учитывались только ключи с галочкой «поиск».
+    - ``maps``: симметрично — выполняется только работа по картам.
+    - ``default``: payload не меняется, режимы определяются чекбоксами ключей.
+    """
+    if mode not in {"search", "maps"}:
+        return cards_payload
+
+    keep_flag = "search_enabled" if mode == "search" else "maps_enabled"
+    drop_flag = "maps_enabled" if mode == "search" else "search_enabled"
+    drop_target = "maps_target" if mode == "search" else "search_target"
+
+    for card in cards_payload:
+        card[drop_target] = 0
+        keys = card.get("keys")
+        if not isinstance(keys, list):
+            continue
+        for key in keys:
+            if isinstance(key, dict):
+                key[drop_flag] = False
+                key[keep_flag] = bool(key.get(keep_flag))
     return cards_payload
 
 
@@ -577,6 +609,7 @@ def create_app(base_dir: Path | None = None, services: AppServices | None = None
             raise HTTPException(status_code=400, detail="Количество потоков должно быть больше 0.")
 
         cards_payload = _build_optimization_cards_payload(resolved_services, payload.card_ids)
+        cards_payload = _apply_optimization_mode(cards_payload, payload.mode)
         run_id = create_run(payload.threads, cards_payload)
         worker = threading.Thread(
             target=_run_optimization_worker,

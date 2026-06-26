@@ -187,6 +187,27 @@ body.card-delete-mode .card-item {
   font-weight: 600;
   min-width: 130px;
 }
+.optimization-mode-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #dfdfdf;
+  font-weight: 600;
+}
+.optimization-mode-select {
+  background: #1c1c1c;
+  color: #f0f0f0;
+  border: 1px solid #3a3a3a;
+  border-radius: 8px;
+  padding: 6px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+.optimization-mode-select:focus {
+  outline: none;
+  border-color: #2fbf68;
+  box-shadow: 0 0 0 2px rgba(47, 191, 104, 0.25);
+}
 .threads-range {
   -webkit-appearance: none;
   appearance: none;

@@ -108,6 +108,7 @@ const state = {
   settingsMode: "edit",
   activeTab: "keys",
   optimizationThreads: 1,
+  optimizationMode: "default",
   optimizationSelectedCardIds: new Set(),
   cardDeleteMode: false,
   cardDeleteSelectedIds: new Set(),
@@ -152,6 +153,7 @@ const ui = {
   optimizationSection: document.getElementById("optimizationSection"),
   optimizationThreadsRange: document.getElementById("optimizationThreadsRange"),
   optimizationThreadsValue: document.getElementById("optimizationThreadsValue"),
+  optimizationModeSelect: document.getElementById("optimizationModeSelect"),
   optimizationSelectAllBtn: document.getElementById("optimizationSelectAllBtn"),
   optimizationPlayBtn: document.getElementById("optimizationPlayBtn"),
   optimizationStatus: document.getElementById("optimizationStatus"),
@@ -633,7 +635,18 @@ function refreshOptimizationStatus() {
     return;
   }
   const selectedCount = state.optimizationSelectedCardIds.size;
-  ui.optimizationStatus.textContent = `Выбрано карточек: ${selectedCount}. Потоки: ${state.optimizationThreads}.`;
+  ui.optimizationStatus.textContent = `Выбрано карточек: ${selectedCount}. Потоки: ${state.optimizationThreads}. Режим: ${optimizationModeLabel(state.optimizationMode)}.`;
+}
+
+function optimizationModeLabel(mode) {
+  switch (mode) {
+    case "search":
+      return "Только поиск";
+    case "maps":
+      return "Только карты";
+    default:
+      return "По умолчанию";
+  }
 }
 
 function refreshCardDeleteUi() {
@@ -683,6 +696,10 @@ async function deleteSelectedCards() {
 function syncOptimizationThreadsUi() {
   ui.optimizationThreadsRange.value = String(state.optimizationThreads);
   ui.optimizationThreadsValue.textContent = String(state.optimizationThreads);
+}
+
+function syncOptimizationModeUi() {
+  ui.optimizationModeSelect.value = state.optimizationMode;
 }
 
 function clearSelectedCardView() {
@@ -900,6 +917,12 @@ ui.importFileInput.onchange = async (event) => {
 
 ui.tabKeysBtn.onclick = () => switchTab("keys");
 ui.tabOptimizationBtn.onclick = () => switchTab("optimization");
+ui.optimizationModeSelect.onchange = () => {
+  const value = ui.optimizationModeSelect.value;
+  state.optimizationMode = ["search", "maps"].includes(value) ? value : "default";
+  syncOptimizationModeUi();
+  refreshOptimizationStatus();
+};
 ui.optimizationThreadsRange.oninput = () => {
   state.optimizationThreads = Number(ui.optimizationThreadsRange.value) || 0;
   syncOptimizationThreadsUi();
@@ -916,10 +939,10 @@ ui.optimizationSelectAllBtn.onclick = () => {
   renderCards();
   refreshOptimizationStatus();
 };
-async function executeOptimization(cardIds, threads, onProgress) {
+async function executeOptimization(cardIds, threads, mode, onProgress) {
   const { run_id: runId } = await api("/api/optimization/run", {
     method: "POST",
-    body: JSON.stringify({ card_ids: cardIds, threads }),
+    body: JSON.stringify({ card_ids: cardIds, threads, mode: mode || "default" }),
   });
 
   while (true) {
@@ -1292,6 +1315,7 @@ function scheduleTaskFromPlay() {
     type: state.scheduleMode,
     cardIds,
     threads,
+    mode: state.optimizationMode,
     status: "scheduled",
     resultText: "",
     stats: null,
@@ -1361,7 +1385,7 @@ async function runTask(task) {
   task.runId = null;
   renderTasks();
   try {
-    const { summary: result } = await executeOptimization(task.cardIds, task.threads, (progress, runId) => {
+    const { summary: result } = await executeOptimization(task.cardIds, task.threads, task.mode, (progress, runId) => {
       task.runId = runId;
       task.stats = progress;
       if (progress.dispatch_control === "paused") {
@@ -1654,11 +1678,13 @@ function renderTasks() {
 
     const meta = document.createElement("div");
     meta.className = "task-meta";
+    const modeNote =
+      task.mode && task.mode !== "default" ? `, режим: ${optimizationModeLabel(task.mode)}` : "";
     if (task.status === "scheduled" && task.nextAt) {
       const when = new Date(task.nextAt).toLocaleString("ru-RU");
       const pauseNote = task.paused ? " На паузе." : "";
       meta.innerHTML =
-        `Карточек: ${task.cardIds.length}, потоки: ${task.threads}. ` +
+        `Карточек: ${task.cardIds.length}, потоки: ${task.threads}${modeNote}. ` +
         `Следующий запуск: <b>${when}</b> · ` +
         `через <span class="task-countdown" data-task="${task.id}">${formatCountdown(getTaskCountdownMs(task))}</span>` +
         pauseNote;
@@ -1669,14 +1695,14 @@ function renderTasks() {
       const pauseNote = task.paused ? " На паузе — открытые окна дорабатывают." : "";
       const stopNote = task.stopRequested ? " Останавливается — новые окна не открываются." : "";
       meta.textContent =
-        `Выполняется… Карточек: ${task.cardIds.length}, потоки: ${task.threads}.` +
+        `Выполняется… Карточек: ${task.cardIds.length}, потоки: ${task.threads}${modeNote}.` +
         pauseNote +
         stopNote;
       meta.textContent += task.statsExpanded
         ? " Статистика развёрнута."
         : " Нажмите, чтобы открыть статистику.";
     } else {
-      meta.textContent = `Карточек: ${task.cardIds.length}, потоки: ${task.threads}.`;
+      meta.textContent = `Карточек: ${task.cardIds.length}, потоки: ${task.threads}${modeNote}.`;
       meta.textContent += task.statsExpanded
         ? " Статистика развёрнута."
         : " Нажмите, чтобы открыть статистику.";
@@ -1743,5 +1769,6 @@ ui.defaultsConfigModal.onclick = (event) => {
 window.addEventListener("pagehide", requestShutdownOnClose);
 
 syncOptimizationThreadsUi();
+syncOptimizationModeUi();
 initScheduleModePanel();
 startup();
